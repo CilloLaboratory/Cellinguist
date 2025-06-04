@@ -71,3 +71,34 @@ def mse_loss_for_expression(logits: torch.Tensor, target: torch.Tensor, ignore_i
     # Compute mean squared error only over valid positions.
     loss = F.mse_loss(expected[valid_mask], target_float[valid_mask])
     return loss
+
+def knn_laplacian_loss(embeddings: torch.Tensor, 
+                       times: torch.Tensor, 
+                       k: int = 5) -> torch.Tensor:
+    """
+    embeddings: (B, d_model)     — cell CLS embeddings
+    times:      (B,)             — predicted pseudotimes for each cell
+    k:          int              — number of nearest neighbors
+    
+    Returns:
+      Scalar: the average of (t_i - t_j)^2 over all i and its k nearest neighbors j.
+    """
+    B, D = embeddings.shape
+    if B <= 1:
+        return torch.tensor(0.0, device=embeddings.device)
+
+    # 1) Pairwise Euclidean distances between embeddings
+    dist_matrix = torch.cdist(embeddings, embeddings, p=2)  # shape (B, B)
+
+    # 2) For each i, find the indices of the k+1 smallest distances (including self)
+    #    Then ignore the first (self), keeping the next k
+    knn_vals, knn_idx = torch.topk(dist_matrix, k=k+1, largest=False)  # each row: [i itself, idx1, idx2, ..., idx_k]
+    neighbors = knn_idx[:, 1:]  # shape (B, k)
+
+    # 3) Compute squared‐difference in predicted times for each neighbor pair
+    t_i = times.unsqueeze(1)                   # (B, 1)
+    t_j = times[neighbors]                     # (B, k)
+    diff_sq = (t_i - t_j).pow(2)                # (B, k)
+
+    # 4) Average over all (i, j) pairs
+    return diff_sq.mean()
