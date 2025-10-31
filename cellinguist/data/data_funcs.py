@@ -254,7 +254,7 @@ class SingleCellDatasetCellTyping(Dataset):
         else:
             domain = 0
         # Get cell type
-            cell_types = int(self.cell_types[idx].item()) if isinstance(self.cell_types[idx], np.generic) else int(self.cell_types[idx])
+        cell_types = int(self.cell_types[idx].item()) if isinstance(self.cell_types[idx], np.generic) else int(self.cell_types[idx])
         return {
             "gene_ids": gene_ids,                 # For masked prediction.
             "expression_tokens": expression_tokens,  # For masked prediction.

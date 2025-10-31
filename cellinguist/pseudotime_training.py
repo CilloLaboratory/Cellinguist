@@ -1,17 +1,23 @@
 import sys
 sys.path.append('/home/arc85/Desktop/Cellinguist/')
 
+import os
 import argparse
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from scipy.sparse import csr_matrix
 import numpy as np
 import anndata as ad
+import torch.distributed as dist
+from cellinguist.models.loss import knn_laplacian_loss
 from cellinguist.data.data_funcs import SingleCellDatasetUnified, collate_fn_unified
-from cellinguist.models.base_model import TokenEmbeddingLayer, FlashTransformerEncoderLayer, MaskedGeneExpressionPredictionHead, MaskedGeneIDPredictionHead, WholeGenomeExpressionPredictionHead, DomainClassifier, FullModel
+from cellinguist.models.base_model import TokenEmbeddingLayer, FlashTransformerEncoderLayer, MaskedGeneExpressionPredictionHead, WholeGenomeExpressionPredictionHead, MaskedGeneIDPredictionHead, DomainClassifier, FullModel
+from cellinguist.models.pseudotime_model import extract_all_cls_embeddings, compute_global_pseudotime, train_pseudotime_regressor, PseudotimeHead
 
 def main():
 
@@ -21,6 +27,7 @@ def main():
     parser.add_argument("--in_model", type=str, required=True, help="Path to trained model, should end in pth extension.")
     parser.add_argument("--domain_for_grad_rev", type=str, help="Optional column name of metadata containing the domain info (such as sequencing batch) for gradient reversal.")
     parser.add_argument("--condition_data", type=str, help="Optional column name of metadata containing condition info.")
+    parser.add_argument("--k_neighbors", type=int, required=True, help="Number of neighbors to consider for pseudotime.")
     parser.add_argument("--batch_size", type=int, default=64, help="Optional column name of metadata containing condition info.")
     parser.add_argument("--reserved_cls_token", type=int, default=0, help="Reserved token for CLS.")
     parser.add_argument("--reserved_pad_token", type=int, default=1, help="Reserved token for padding.")
@@ -33,17 +40,23 @@ def main():
     parser.add_argument("--flash_encoder_layers", type=int, default=4, help="Number of layers for flash encoder.")
     parser.add_argument("--flash_encoder_heads", type=int, default=8, help="Number of heads for flash encoder.")
     parser.add_argument("--prediction_domain_head_dim", type=int, default=512, help="Dimensions for prediction and domain classification heads.")
+    parser.add_argument("--epochs", type=int, default=5, help="Number of epochs for training.")
     parser.add_argument("--grad_rev_lambda", type=float, default=1.0, help="Lambda value for gradient reversal.")
-    parser.add_argument("--out_embedding", type=str, required=True, help="Path to save output output embedding as a csv.")
+    parser.add_argument("--out_model", type=str, required=True, help="Path to save output model as pth.")
+    parser.add_argument("--out_pseudotime", type=str, required=True, help="Path to save output pseudotime as a csv.")
     args = parser.parse_args()
 
     ## Load anndata
     dat = ad.read_h5ad(args.input_anndata)
+    # sample random cells 
+    # my_vec = np.array(range(dat.shape[0]))
+    #random_pts = np.random.choice(my_vec,size=5000,replace=F)
+    # dat = dat[random_pts,]
+    ## Subset to specific cell type 
     dense_matrix = dat.X.toarray()
 
     ## Set gene ids and vocab size
     gene_ids = dat.var.gene.to_numpy()
-    # gene_ids = dat.var.features.to_numpy()
     num_of_genes = len(gene_ids)
 
     ## Set domains for normalization (optional)
@@ -85,11 +98,6 @@ def main():
     # Initialize a device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ## Create dataset 
-    dataset = SingleCellDatasetUnified(dense_matrix, condition_labels = condition_labels, domain_labels = seq_batch_ids, num_expression_bins = num_expression_bins, num_library_bins = NUM_LIBRARY_BINS, reserved_tokens_count = 3)
-    collate = partial(collate_fn_unified, cls_token_id=CLS_TOKEN_ID, pad_token_id=PAD_TOKEN_ID)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collate, shuffle=False)
-
     ## Token embedding 
     token_embedding_layer = TokenEmbeddingLayer(
         gene_vocab_size=gene_vocab_size,
@@ -101,7 +109,7 @@ def main():
         use_positional=False,
         pad_token_id=PAD_TOKEN_ID
     ).to(device)
-
+    
     ## Flash transformer
     flash_encoder_layers = nn.ModuleList([
         FlashTransformerEncoderLayer(d_model=args.flash_encoder_dim, nhead=args.flash_encoder_heads, dropout=0.1, causal=False)
@@ -113,17 +121,17 @@ def main():
     masked_head = MaskedGeneExpressionPredictionHead(
         d_model=args.prediction_domain_head_dim,
         expression_vocab_size=expression_vocab_size
-    ).to(device)
-
-    masked_gene_head = MaskedGeneIDPredictionHead(
-        d_model=args.prediction_domain_head_dim,
-        gene_vocab_size=gene_vocab_size
-    ).to(device)
+        ).to(device)
 
     whole_genome_head = WholeGenomeExpressionPredictionHead(
         d_model=args.prediction_domain_head_dim,
         total_gene_count=num_of_genes,
         expression_vocab_size=expression_vocab_size
+    ).to(device)
+
+    masked_gene_head = MaskedGeneIDPredictionHead(
+        d_model=args.prediction_domain_head_dim,
+        gene_vocab_size=gene_vocab_size
     ).to(device)
     
     ## Domain classifier
@@ -140,25 +148,54 @@ def main():
 
     print(f"Checkpoint loaded for inference. Current epoch is {start_epoch+1}")
 
-    # Extract cell embeddings
-    embeddings_list = []
-    full_model.eval()
+     # 1. Extract all CLS embeddings from the pretrained backbone
+    cls_emb_np = extract_all_cls_embeddings(
+        pretrained_model=full_model,
+        dense_matrix=dense_matrix,
+        condition_labels=None,
+        domain_labels=None,
+        num_expression_bins=num_expression_bins,
+        NUM_LIBRARY_BINS=NUM_LIBRARY_BINS,
+        CLS_TOKEN_ID=CLS_TOKEN_ID,
+        PAD_TOKEN_ID=PAD_TOKEN_ID,
+        MASK_TOKEN_ID=MASK_TOKEN_ID,
+        device=device,
+        batch_size= 64
+    )  # shape: (N, d_model)
 
-    with torch.no_grad():
-        for batch in dataloader:
-            for key in batch:
-                batch[key] = batch[key].to(device)
-            # Forward pass through the full model.
-            _, _, cls_token, _, _ = full_model(batch)
-            cell_embeddings = cls_token
-            embeddings_list.append(cell_embeddings.cpu())
+    print(f"Cell embedding extracted. Moving to graph creation.")
 
-    # Concatenate into one tensor
-    all_embeddings = torch.cat(embeddings_list,dim=0).float().detach().numpy()
-    print("Cell embeddings shape:", all_embeddings.shape)
-    
+    # 2. Compute global pseudotime via K-NN graph and Laplacian eigenmap
+    pseudotime_np = compute_global_pseudotime(
+        cls_embeddings=cls_emb_np,
+        k_neighbors=args.k_neighbors
+    )  # shape: (N,)
+
+    print(f"Global pseudotime computed. Moving to training pseudotime regressor.")
+
+    # 3. Train a regressor head to map CLS → pseudotime
+    trained_head, optimizer, epoch = train_pseudotime_regressor(
+        cls_embeddings=cls_emb_np,
+        pseudotime_targets=pseudotime_np,
+        d_model=512,
+        device=device,
+        batch_size=64,
+        num_epochs=args.epochs,
+        lr=1e-3
+    )
+
+    torch.save({
+        "epoch": epoch,
+        "pseudotime_state": trained_head.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+    },  args.out_model)
+
+    # Combine with gene names 
+    pseudotime_pd = pd.DataFrame(pseudotime_np)
     # Save output
-    pd.DataFrame(all_embeddings).to_csv(args.out_embedding)
+    pseudotime_pd.to_csv(args.out_pseudotime)
+
+    print(f"Model and pseudotime saved.")
 
 if __name__ == "__main__":
     main()
