@@ -49,6 +49,8 @@ def main():
     dense_matrix = dat.X.toarray()
 
     ## Set gene ids and vocab size
+    # gene_ids = dat.var.gene.to_numpy()
+    # gene is in var in anndata - sometimes called features 
     gene_ids = dat.var.gene.to_numpy()
     num_of_genes = len(gene_ids)
 
