@@ -72,6 +72,12 @@ def main():
     MASK_TOKEN_ID  = args.reserved_mask_token
     reserved_tokens_count = 3
 
+    # --- Cytokine conditioning constants ---
+    CYTOKINE_PAD_ID = 0              # used for padding in embeddings
+    CYTOKINE_ID_OFFSET = 1           # shift real ids by +1 so 0 stays as PAD
+    DEFAULT_TIME_HOURS = 0.0         # fallback if time not provided
+    DEFAULT_DOSE_VALUE = 0.0         # e.g., log10(nM)=0.0; use what fits your data
+
     num_expression_bins = args.num_expression_bins
     expression_vocab_size = num_expression_bins + reserved_tokens_count
     gene_vocab_size = num_of_genes + reserved_tokens_count
