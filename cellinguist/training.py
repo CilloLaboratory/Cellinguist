@@ -86,7 +86,9 @@ def main():
         CONDITION_VOCAB_SIZE = len(np.unique(condition_labels))
     else:
         CONDITION_VOCAB_SIZE = 1
-        
+
+    n_cytokines = CONDITION_VOCAB_SIZE  # for v1, reuse your factorized condition labels
+
     NUM_LIBRARY_BINS = args.num_library_bins
 
     if seq_batch_ids is not None:
@@ -152,19 +154,36 @@ def main():
     ## Domain classifier
     domain_classifier = DomainClassifier(input_dim=args.prediction_domain_head_dim, hidden_dim=256, num_domains=num_domains).to(device)
 
+    # --- Cytokine conditioner & perturbation head (new) ---
+    n_cytokines = CONDITION_VOCAB_SIZE  # for v1, reuse your factorized condition labels
+    conditioner = CytokineConditioner(n_cytokines=n_cytokines,
+                                      d_model=args.prediction_domain_head_dim,
+                                      receptor_dim=0).to(device)
+    perturb_head = PerturbationHead(d_model=args.prediction_domain_head_dim,
+                                    hidden=512,
+                                    use_film=True).to(device)
+
+
     # Combine components into a full model.
     # Assume FullModel is a module that takes the token embedding layer, encoder layers, and prediction heads.
-    full_model = FullModel(token_embedding_layer, flash_encoder_layers, masked_head, whole_genome_head, domain_classifier, masked_gene_head, lambda_value = args.grad_rev_lambda).to(device)
+    full_model = FullModel(token_embedding_layer,
+                           flash_encoder_layers,
+                           masked_head,
+                           whole_genome_head,
+                           domain_classifier,
+                           masked_gene_head,
+                           lambda_value = args.grad_rev_lambda,
+                           conditioner=conditioner,
+                           perturb_head=perturb_head).to(device)
     
-    # Freeze expression embeddings for first epoch
     for p in full_model.token_embedding_layer.expression_embeddings.parameters():
         p.requires_grad = True
 
     for p in full_model.masked_head.parameters():
-        p.required_grad = True
+        p.requires_grad = True
 
     for p in full_model.whole_genome_head.parameters():
-        p.required_grad = True
+        p.requires_grad = True
 
     # Wrap the model with DistributedDataParallel.
     ddp_model = DDP(full_model, device_ids=[local_rank])
