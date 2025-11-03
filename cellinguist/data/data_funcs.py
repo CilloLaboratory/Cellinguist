@@ -3,12 +3,6 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 
-# --- Cytokine conditioning constants ---
-CYTOKINE_PAD_ID = 0              # used for padding in embeddings
-CYTOKINE_ID_OFFSET = 1           # shift real ids by +1 so 0 stays as PAD
-DEFAULT_TIME_HOURS = 0.0         # fallback if time not provided
-DEFAULT_DOSE_VALUE = 0.0         # e.g., log10(nM)=0.0; use what fits your data
-
 def bin_expression_counts(counts: np.ndarray, num_expression_bins: int, reserved_tokens_count: int):
     """
     Bins raw gene expression counts into discrete tokens.
