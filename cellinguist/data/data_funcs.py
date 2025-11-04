@@ -48,6 +48,12 @@ def bin_expression_counts_full(row: np.ndarray, num_expression_bins: int, reserv
         binned = np.digitize(row, bin_edges[1:-1], right=True)
     return (binned + reserved_tokens_count).tolist()
 
+# --- Cytokine conditioning constants ---
+CYTOKINE_PAD_ID = 0              # used for padding in embeddings
+CYTOKINE_ID_OFFSET = 1           # shift real ids by +1 so 0 stays as PAD
+DEFAULT_TIME_HOURS = 0.0         # fallback if time not provided
+DEFAULT_DOSE_VALUE = 0.0         # e.g., log10(nM)=0.0; use what fits your data
+
 class SingleCellDatasetUnified(Dataset):
     """
     Expects an expression matrix of shape (num_cells, num_genes) and an optional array of condition labels.
@@ -58,7 +64,19 @@ class SingleCellDatasetUnified(Dataset):
       - A whole genome target is computed for every gene.
       - The number of expressed genes (library size) is computed and binned using global quantile binning.
     """
-    def __init__(self, expression_matrix: np.ndarray, num_library_bins: int, num_expression_bins: int, reserved_tokens_count: int, condition_labels: np.ndarray = None, domain_labels: np.ndarray = None):
+    def __init__(
+            self, 
+            expression_matrix: np.ndarray, 
+            num_library_bins: int, 
+            num_expression_bins: int, 
+            reserved_tokens_count: int, 
+            condition_labels: np.ndarray = None, 
+            domain_labels: np.ndarray = None,
+            cytokine_ids_list: list | None = None,   # list of lists of ints
+            doses_list: list | None = None,          # list of lists of floats (aligned to cytokine_ids_list)
+            time_hours: np.ndarray | list | None = None,  # (N,) floats
+            receptor_matrix: np.ndarray | None = None
+    ):
         self.expression_matrix = np.atleast_2d(np.asarray(expression_matrix))
         if condition_labels is not None:
             self.condition_labels = np.atleast_1d(np.asarray(condition_labels))
@@ -71,6 +89,11 @@ class SingleCellDatasetUnified(Dataset):
         self.num_library_bins = num_library_bins
         self.num_expression_bins = num_expression_bins
         self.reserved_tokens_count = reserved_tokens_count
+
+        self.cytokine_ids_list = cytokine_ids_list  # keep as Python lists for variable length
+        self.doses_list = doses_list
+        self.time_hours = np.asarray(time_hours) if time_hours is not None else None
+        self.receptor_matrix = np.asarray(receptor_matrix) if receptor_matrix is not None else None
         # Precompute library sizes for all cells
         library_sizes = []
         for i in range(self.expression_matrix.shape[0]):
@@ -120,7 +143,7 @@ class SingleCellDatasetUnified(Dataset):
             domain = int(self.domain_labels[idx].item()) if isinstance(self.domain_labels[idx], np.generic) else int(self.domain_labels[idx])
         else:
             domain = 0
-        return {
+        sample = {
             "gene_ids": gene_ids,                 # For masked prediction.
             "expression_tokens": expression_tokens,  # For masked prediction.
             "whole_genome_target": whole_genome_target,  # For whole genome prediction.
@@ -128,7 +151,27 @@ class SingleCellDatasetUnified(Dataset):
             "library_size": library_bin,           # Global library size bin.
             "domain": domain,          # Domain label for gradient reversal.
         }
-    
+
+        if self.cytokine_ids_list is not None and self.doses_list is not None:
+            c_ids = self.cytokine_ids_list[idx]
+            ds = self.doses_list[idx]
+            sample["cytokine_ids"] = [int(c) + CYTOKINE_ID_OFFSET for c in c_ids]
+            sample["doses"] = [float(d) for d in ds]
+        else:
+            cond = sample["condition"]
+            sample["cytokine_ids"] = [int(cond) + CYTOKINE_ID_OFFSET]
+            sample["doses"] = [float(DEFAULT_DOSE_VALUE)]
+
+        if self.time_hours is not None:
+            sample["time_hours"] = float(self.time_hours[idx])
+        else:
+            sample["time_hours"] = float(DEFAULT_TIME_HOURS)
+
+        if self.receptor_matrix is not None:
+            sample["receptor_vec"] = self.receptor_matrix[idx, :].astype(np.float32)
+
+        return sample
+
 def collate_fn_unified(samples, cls_token_id: int, pad_token_id: int):
     """
     Collate function to combine a list of samples into a batch.
@@ -143,6 +186,10 @@ def collate_fn_unified(samples, cls_token_id: int, pad_token_id: int):
     conditions = []
     library_sizes = []
     domain = []
+    cytokine_ids_batch = []
+    doses_batch = []
+    time_hours_batch = []
+    receptor_batch = []
     for sample in samples:
         # Prepend [CLS] to gene_ids.
         gene_ids = [cls_token_id] + sample["gene_ids"]
@@ -163,22 +210,38 @@ def collate_fn_unified(samples, cls_token_id: int, pad_token_id: int):
         )
         lib_size = sample.get("library_size")
         library_sizes.append(lib_size)
+        cytokine_ids_batch.append(torch.tensor(sample["cytokine_ids"], dtype=torch.long))
+        doses_batch.append(torch.tensor(sample["doses"], dtype=torch.float))
+        time_hours_batch.append(float(sample["time_hours"]))
+        if "receptor_vec" in sample:
+            receptor_batch.append(torch.tensor(sample["receptor_vec"], dtype=torch.float))
     padded_gene_ids = pad_sequence(gene_ids_list, batch_first=True, padding_value=pad_token_id)
     padded_expr_tokens = pad_sequence(expr_tokens_list, batch_first=True, padding_value=pad_token_id)
+    cytokine_ids_padded = pad_sequence(cytokine_ids_batch, batch_first=True, padding_value=CYTOKINE_PAD_ID)
+    doses_padded = pad_sequence(doses_batch, batch_first=True, padding_value=0.0)
+    time_hours_tensor = torch.tensor(time_hours_batch, dtype=torch.float)
     conditions = torch.tensor(conditions, dtype=torch.long)
     domain = torch.tensor(domain, dtype=torch.long)
     # Stack whole genome targets; they are assumed to be the same length (num_genes).
     whole_genome_targets = torch.stack(whole_genome_targets, dim=0)
     library_bins = torch.tensor(library_sizes, dtype=torch.long)
-    return {
+
+    batch = {
         "gene_ids": padded_gene_ids,             # (batch_size, max_seq_len)
         "expression_tokens": padded_expr_tokens,   # (batch_size, max_seq_len)
         "whole_genome_target": whole_genome_targets,  # (batch_size, num_genes)
         "condition": conditions,                  # (batch_size,)
         "library_size": library_bins,              # (batch_size,) -- binned library size
-        "domain": domain # domain for gradient reversal
+        "domain": domain, # domain for gradient reversal
+        "cytokine_ids": cytokine_ids_padded,   # (B, Cmax)  Long
+        "doses": doses_padded,                 # (B, Cmax)  Float
+        "time_hours": time_hours_tensor,       # (B,)       Float
     }
 
+    if len(receptor_batch) > 0:
+        batch["receptor_vec"] = torch.stack(receptor_batch, dim=0)  # (B, R)
+
+    return batch
 
 class SingleCellDatasetCellTyping(Dataset):
     """
