@@ -263,8 +263,76 @@ class DomainClassifier(nn.Module):
     def forward(self, x):
         return self.classifier(x)
     
+class CytokineConditioner(nn.Module):
+    """
+    Encodes cytokine condition as a fixed-size vector h_c from:
+      - cytokine ids (possibly multiple; pooled)
+      - doses (log-scaled; same shape as ids)
+      - time in hours (log1p)
+      - optional receptor features from baseline expression
+    Backward compatible: if batch only has a single integer 'condition',
+    we silently fall back to your existing condition embedding.
+    """
+    def __init__(self, n_cytokines: int, d_model: int, receptor_dim: int = 0):
+        super().__init__()
+        H = d_model  # keep everything in model dim for easy fusion
+        self.cyt = nn.Embedding(n_cytokines, H)
+        self.dose_mlp = nn.Sequential(nn.Linear(1, H), nn.SiLU(), nn.Linear(H, H))
+        self.time_mlp = nn.Sequential(nn.Linear(1, H), nn.SiLU(), nn.Linear(H, H))
+        self.rec_mlp = nn.Sequential(nn.Linear(receptor_dim, H), nn.SiLU(), nn.Linear(H, H)) if receptor_dim > 0 else None
+        self.out = nn.LayerNorm(H)
+
+    def forward(self, batch: dict, default_condition_emb: torch.Tensor = None):
+        """
+        Returns h_c (B, H).
+
+        Accepts either:
+          - rich fields: 'cytokine_ids' (B,Cmax), 'doses' (B,Cmax), 'time_hours' (B,), optional 'receptor_vec' (B,R)
+          - or falls back to default_condition_emb (your existing single condition embedding in CLS)
+        """
+        if all(k in batch for k in ("cytokine_ids", "doses", "time_hours")):
+            ids   = batch["cytokine_ids"]        # (B, Cmax)
+            doses = batch["doses"].unsqueeze(-1) # (B, Cmax, 1)  expected log10-scale
+            t     = batch["time_hours"].unsqueeze(-1)  # (B,1)
+            c_emb = self.cyt(ids)                        # (B, Cmax, H)
+            d_emb = self.dose_mlp(doses)                 # (B, Cmax, H)
+            pooled = (c_emb + d_emb).mean(dim=1)         # simple average; can swap for attention later
+            t_emb  = self.time_mlp(t).squeeze(1)         # (B,H)
+            h_c = pooled + t_emb
+            if self.rec_mlp and ("receptor_vec" in batch):
+                h_c = h_c + self.rec_mlp(batch["receptor_vec"])
+            return self.out(h_c)
+        else:
+            # Backward-compatible: use the (already-added) condition embedding in CLS
+            # If not provided, just return zeros so downstream add is a no-op.
+            return default_condition_emb if default_condition_emb is not None else 0.0
+
+class PerturbationHead(nn.Module):
+    """
+    Predicts a Δ on the [CLS] embedding conditioned on h_c.
+    """
+    def __init__(self, d_model: int, hidden: int = 512, use_film: bool = True):
+        super().__init__()
+        self.use_film = use_film
+        if use_film:
+            self.gamma = nn.Sequential(nn.Linear(d_model, d_model), nn.Tanh())
+            self.beta  = nn.Sequential(nn.Linear(d_model, d_model), nn.Tanh())
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * d_model, hidden),
+            nn.ReLU(),
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, d_model)
+        )
+
+    def forward(self, z_cls: torch.Tensor, h_c: torch.Tensor):
+        if isinstance(h_c, (int, float)):  # fallback path
+            return z_cls
+        z_mod = (1 + self.gamma(h_c)) * z_cls + self.beta(h_c) if self.use_film else z_cls
+        dz = self.mlp(torch.cat([z_mod, h_c], dim=-1))
+        return z_cls + dz  # z'
+
 class FullModel(nn.Module):
-    def __init__(self, token_embedding_layer, encoder_layers, masked_head, whole_genome_head, domain_classifier, gene_id_head, lambda_value):
+    def __init__(self, token_embedding_layer, encoder_layers, masked_head, whole_genome_head, domain_classifier, gene_id_head, lambda_value, conditioner: nn.Module = None, perturb_head: nn.Module = None):
         super(FullModel, self).__init__()
         self.token_embedding_layer = token_embedding_layer
         self.encoder_layers = encoder_layers  # assume this is an nn.ModuleList
@@ -273,6 +341,8 @@ class FullModel(nn.Module):
         self.domain_classifier = domain_classifier
         self.lambda_value = lambda_value
         self.gene_id_head = gene_id_head
+        self.conditioner = conditioner
+        self.perturb_head = perturb_head
     def forward(self, batch):
         """
         Expects batch to be a dictionary with keys:
@@ -294,16 +364,23 @@ class FullModel(nn.Module):
             x = layer(x)
         # Masked prediction logits.
         masked_logits = self.masked_head(x)
-        # Whole genome prediction: extract [CLS] token.
-        cls_token = x[:, 0, :]  # (batch_size, d_model)
-        whole_genome_logits = self.whole_genome_head(cls_token)
+        # Whole genome prediction: extract [CLS] token as baseline state
+        cls_token = x[:, 0, :]  # (B, d_model)
+        if self.conditioner is not None and self.perturb_head is not None:
+            # derive default cond embedding already added to CLS by TokenEmbeddingLayer
+            default_c = None  # we added condition+library to CLS already
+            h_c = self.conditioner(batch, default_condition_emb=default_c)
+            cls_token_for_genome = self.perturb_head(cls_token, h_c)
+        else:
+            cls_token_for_genome = cls_token
+        whole_genome_logits = self.whole_genome_head(cls_token_for_genome)
         # Gene id prediction
         gene_id_logits = self.gene_id_head(x)
         # Domain classification 
         reversed_embeddings = grad_reverse(cls_token, lambda_=self.lambda_value)
         # Forward pass through the domain classifer
         domain_preds = self.domain_classifier(reversed_embeddings)
-        return masked_logits, whole_genome_logits, cls_token, domain_preds, gene_id_logits
+        return masked_logits, whole_genome_logits, cls_token_for_genome, domain_preds, gene_id_logits
     
 def get_random_mask_positions(token_tensor, mask_token_id: int, mask_fraction=0.2):
     """
