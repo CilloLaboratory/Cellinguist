@@ -172,9 +172,3 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
-
-# Saved files 
-*.pth
-*.h5ad
-*.csv
-*.tsv
