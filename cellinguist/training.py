@@ -16,7 +16,7 @@ import anndata as ad
 import torch.distributed as dist
 from cellinguist.models.loss import mse_loss_for_expression, compute_similarity_loss
 from cellinguist.data.data_funcs import SingleCellDatasetUnified, collate_fn_unified
-from cellinguist.models.base_model import TokenEmbeddingLayer, FlashTransformerEncoderLayer, MaskedGeneExpressionPredictionHead, MaskedGeneIDPredictionHead, WholeGenomeExpressionPredictionHead, DomainClassifier, FullModel, get_random_mask_positions, train_epoch_ddp
+from cellinguist.models.base_model import TokenEmbeddingLayer, FlashTransformerEncoderLayer, MaskedGeneExpressionPredictionHead, MaskedGeneIDPredictionHead, WholeGenomeExpressionPredictionHead, DomainClassifier, FullModel, get_random_mask_positions, train_epoch_ddp, CytokineConditioner, PerturbationHead
 
 def main():
 
@@ -81,7 +81,7 @@ def main():
     else:
         CONDITION_VOCAB_SIZE = 1
         
-    n_cytokines = CONDITION_VOCAB_SIZE  # for v1, reuse your factorized condition labels
+    n_Cs = CONDITION_VOCAB_SIZE  # for v1, reuse your factorized condition labels
 
     NUM_LIBRARY_BINS = args.num_library_bins
 

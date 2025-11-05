@@ -343,6 +343,7 @@ class FullModel(nn.Module):
         self.gene_id_head = gene_id_head
         self.conditioner = conditioner
         self.perturb_head = perturb_head
+        
     def forward(self, batch):
         """
         Expects batch to be a dictionary with keys:

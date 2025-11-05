@@ -48,6 +48,11 @@ def bin_expression_counts_full(row: np.ndarray, num_expression_bins: int, reserv
         binned = np.digitize(row, bin_edges[1:-1], right=True)
     return (binned + reserved_tokens_count).tolist()
 
+CYTOKINE_PAD_ID = 0              # used for padding in embeddings
+CYTOKINE_ID_OFFSET = 1           # shift real ids by +1 so 0 stays as PAD
+DEFAULT_TIME_HOURS = 0.0         # fallback if time not provided
+DEFAULT_DOSE_VALUE = 0.0         # e.g., log10(nM)=0.0; use what fits your data
+
 class SingleCellDatasetUnified(Dataset):
     """
     Expects an expression matrix of shape (num_cells, num_genes) and an optional array of condition labels.
