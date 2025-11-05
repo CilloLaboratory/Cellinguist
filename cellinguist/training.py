@@ -83,15 +83,16 @@ def main():
     ## Set conditions (optional)
     if args.condition_data is not None:
         condition_labels = torch.tensor(dat.obs[args.condition_data].factorize()[0])
+        num_cytokines = len(set(dat.obs[args.condition_data].factorize()[0]))
+        CYTOKINE_PAD_TOKEN_ID = num_cytokines
     else:
         condition_labels = None
+        CYTOKINE_PAD_TOKEN_ID = 0
 
     ## Set other input parameters
     CLS_TOKEN_ID = args.reserved_cls_token
     PAD_TOKEN_ID   = args.reserved_pad_token
     MASK_TOKEN_ID  = args.reserved_mask_token
-    num_cytokines = len(set(dat.obs[args.condition_data].factorize()[0]))
-    CYTOKINE_PAD_TOKEN_ID = num_cytokines
     reserved_tokens_count = 3
 
     num_expression_bins = args.num_expression_bins
