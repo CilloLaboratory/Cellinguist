@@ -420,15 +420,19 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
         optimizer.zero_grad()
         for step in range(num_iterative_steps): 
             # Update the batch dictionary with the current expression tokens.
-            mask_positions = get_random_mask_positions(current_expression_tokens, mask_fraction)
+            mask_positions = get_random_mask_positions(current_expression_tokens,
+                                                       mask_token_id, 
+                                                       mask_fraction
+                                                       )
             # (The rest of the batch remains unchanged.)
-            input_expression_tokens = current_expression_tokens
-            input_gene_id_tokens = current_gene_id_tokens
-            batch['expression_tokens'][mask_positions] = mask_token_id
-            batch["gene_ids"][mask_positions] = mask_token_id
-            # Forward pass: Embed tokens, process with the transformer encoder,
-            # and obtain prediction logits for the expression tokens.
-            masked_logits, whole_genome_logits, cls_token, domain_preds, gene_id_logits = ddp_model(batch)
+            input_expression_tokens = current_expression_tokens.clone()
+            input_gene_id_tokens = current_gene_id_tokens.clone()
+            masked_input = dict(batch)
+            masked_input['expression_tokens'] = current_expression_tokens.clone()
+            masked_input['gene_ids'] = current_gene_id_tokens.clone()
+            masked_input['expression_tokens'][mask_positions] = mask_token_id
+            masked_input["gene_ids"][mask_positions] = mask_token_id
+            masked_logits, whole_genome_logits, cls_token, domain_preds, gene_id_logits = ddp_model(masked_input)
             # Compute loss only on the masked positions
             if mask_positions.sum() > 0:
                 loss_masked = mse_loss_for_expression(masked_logits[mask_positions], input_expression_tokens[mask_positions], ignore_index=pad_token_id)
@@ -442,7 +446,7 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
             # Compute a domain classification loss (e.g., cross-entropy) using the domain labels:
             loss_domain = F.cross_entropy(domain_preds, batch['domain'])
             # Combine losses
-            loss = loss_masked*0.005 + loss_genome*0.01 + loss_similarity*10 + loss_domain*5 + loss_gene_id*5
+            loss = 0.005*loss_masked + 0.05*loss_genome + 2.0*loss_similarity + 5.0*loss_domain + 5.0*loss_gene_id
             loss.backward()
             optimizer.step()
             # Teacher forcing: Update the current expression tokens at masked positions with the model's predictions
