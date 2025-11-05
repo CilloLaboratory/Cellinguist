@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--reserved_cls_token", type=int, default=0, help="Reserved token for CLS.")
     parser.add_argument("--reserved_pad_token", type=int, default=1, help="Reserved token for padding.")
     parser.add_argument("--reserved_mask_token", type=int, default=2, help="Reserved token for masking.")
+    parser.add_argument("--cytokine_pad_token_id", type=int, default=0, help="Reserved cytokine token for masking.")
     parser.add_argument("--num_expression_bins", type=int, default=128, help="Number of bins for expression data.")
     parser.add_argument("--num_library_bins", type=int, default=20, help="Number of bins for library size normalization.")
     parser.add_argument("--max_seq_length", type=int, default=1200, help="Maximum sequence length to consider for input.")
@@ -43,6 +44,25 @@ def main():
     parser.add_argument("--epochs", type=int, default=5, help="Number of epochs for training.")
     parser.add_argument("--out_model", type=str, required=True, help="Path to save output model, should end in pth extension.")
     args = parser.parse_args()
+
+    ## Set up distributed training
+    def ddp_setup():
+        # torchrun sets these
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        rank       = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
+
+        # optional but helpful
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+
+        return local_rank, rank, world_size
+
+    local_rank, rank, world_size = ddp_setup()
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     ## Load anndata
     dat = ad.read_h5ad(args.input_anndata)
@@ -70,6 +90,8 @@ def main():
     CLS_TOKEN_ID = args.reserved_cls_token
     PAD_TOKEN_ID   = args.reserved_pad_token
     MASK_TOKEN_ID  = args.reserved_mask_token
+    num_cytokines = len(set(dat.obs[args.condition_data].factorize()[0]))
+    CYTOKINE_PAD_TOKEN_ID = num_cytokines
     reserved_tokens_count = 3
 
     num_expression_bins = args.num_expression_bins
@@ -80,8 +102,6 @@ def main():
         CONDITION_VOCAB_SIZE = len(np.unique(condition_labels))
     else:
         CONDITION_VOCAB_SIZE = 1
-        
-    n_Cs = CONDITION_VOCAB_SIZE  # for v1, reuse your factorized condition labels
 
     NUM_LIBRARY_BINS = args.num_library_bins
 
@@ -92,17 +112,11 @@ def main():
         
     NUM_LIBRARY_BINS = args.num_library_bins
 
-    # Initialize the process group.
-    dist.init_process_group(backend='nccl')
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
-
     ## Create dataset 
     dataset = SingleCellDatasetUnified(dense_matrix, condition_labels = condition_labels, domain_labels = seq_batch_ids, num_expression_bins = num_expression_bins, num_library_bins = NUM_LIBRARY_BINS, reserved_tokens_count = 3)
-    sampler = DistributedSampler(dataset)
-    collate = partial(collate_fn_unified, cls_token_id=CLS_TOKEN_ID, pad_token_id=PAD_TOKEN_ID)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler = sampler, collate_fn=collate)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    collate = partial(collate_fn_unified, cls_token_id=CLS_TOKEN_ID, pad_token_id=PAD_TOKEN_ID, cytokine_pad_token_id=CYTOKINE_PAD_TOKEN_ID)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler = sampler, pin_memory=True, drop_last=True, collate_fn=collate)
 
     ## Token embedding 
     token_embedding_layer = TokenEmbeddingLayer(
@@ -151,9 +165,10 @@ def main():
     # --- Cytokine conditioner & perturbation head (new) ---
     n_cytokines = CONDITION_VOCAB_SIZE  # for v1, reuse your factorized condition labels
     conditioner = CytokineConditioner(n_cytokines=n_cytokines,
-                                      d_model=args.prediction_domain_head_dim,
-                                      receptor_dim=0).to(device)
-    perturb_head = PerturbationHead(d_model=args.prediction_domain_head_dim,
+                                      d_model=512,
+                                      receptor_dim=0,
+                                      padding_idx=CYTOKINE_PAD_TOKEN_ID).to(device)
+    perturb_head = PerturbationHead(d_model=512,
                                     hidden=512,
                                     use_film=True).to(device)
 
@@ -167,7 +182,7 @@ def main():
                            masked_gene_head,
                            lambda_value = args.grad_rev_lambda,
                            conditioner=conditioner,
-                           perturb_head=perturb_head).to(device)
+                           perturb_head=perturb_head)
     
     # Freeze expression embeddings for first epoch
     for p in full_model.token_embedding_layer.expression_embeddings.parameters():
@@ -180,7 +195,12 @@ def main():
         p.requires_grad = True
 
     # Wrap the model with DistributedDataParallel.
-    ddp_model = DDP(full_model, device_ids=[local_rank])
+    ddp_model = DDP(full_model.to(device), 
+                    device_ids=[local_rank],
+                    output_device=local_rank,
+                    find_unused_parameters=False,
+                    broadcast_buffers=False
+                    )
 
     # Create your dataset and distributed sampler.
     # Assume dataset and collate_fn_unified are defined.

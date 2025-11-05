@@ -171,7 +171,7 @@ class SingleCellDatasetUnified(Dataset):
 
         return sample
 
-def collate_fn_unified(samples, cls_token_id: int, pad_token_id: int):
+def collate_fn_unified(samples, cls_token_id: int, pad_token_id: int, cytokine_pad_token_id: int):
     """
     Collate function to combine a list of samples into a batch.
     For each sample:
@@ -179,6 +179,28 @@ def collate_fn_unified(samples, cls_token_id: int, pad_token_id: int):
       - Pad all sequences to the maximum length in the batch using the [PAD] token.
       - Collect condition labels into a tensor.
     """
+    
+    # --- Normalize input to a list[dict] ---
+    if isinstance(samples, dict):
+        # DataLoader handed us a single sample (dict)
+        samples = [samples]
+    elif isinstance(samples, tuple):
+        # Some wrappers pass (list_of_samples,) or other tuple forms
+        if len(samples) == 1 and isinstance(samples[0], list):
+            samples = samples[0]
+        else:
+            samples = list(samples)
+
+    # --- Validate type to avoid silent bugs ---
+    if not isinstance(samples, list) or not all(isinstance(b, dict) for b in samples):
+        raise TypeError(
+            f"collate_fn_unified expected list[dict], got {type(samples)} "
+            f"with element types {[type(x) for x in (samples if isinstance(samples, list) else [])]}"
+        )
+    
+    batch = {}
+    B = len(samples)
+
     gene_ids_list = []
     expr_tokens_list = []
     whole_genome_targets = []
@@ -216,7 +238,7 @@ def collate_fn_unified(samples, cls_token_id: int, pad_token_id: int):
             receptor_batch.append(torch.tensor(sample["receptor_vec"], dtype=torch.float))
     padded_gene_ids = pad_sequence(gene_ids_list, batch_first=True, padding_value=pad_token_id)
     padded_expr_tokens = pad_sequence(expr_tokens_list, batch_first=True, padding_value=pad_token_id)
-    cytokine_ids_padded = pad_sequence(cytokine_ids_batch, batch_first=True, padding_value=CYTOKINE_PAD_ID)
+    cytokine_ids_padded = pad_sequence(cytokine_ids_batch, batch_first=True, padding_value=cytokine_pad_token_id)
     doses_padded = pad_sequence(doses_batch, batch_first=True, padding_value=0.0)
     time_hours_tensor = torch.tensor(time_hours_batch, dtype=torch.float)
     conditions = torch.tensor(conditions, dtype=torch.long)
@@ -236,9 +258,6 @@ def collate_fn_unified(samples, cls_token_id: int, pad_token_id: int):
         "doses": doses_padded,                 # (B, Cmax)  Float
         "time_hours": time_hours_tensor,       # (B,)       Float
     }
-
-    if len(receptor_batch) > 0:
-        batch["receptor_vec"] = torch.stack(receptor_batch, dim=0)  # (B, R)
 
     return batch
 

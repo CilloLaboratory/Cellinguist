@@ -264,48 +264,74 @@ class DomainClassifier(nn.Module):
         return self.classifier(x)
     
 class CytokineConditioner(nn.Module):
-    """
-    Encodes cytokine condition as a fixed-size vector h_c from:
-      - cytokine ids (possibly multiple; pooled)
-      - doses (log-scaled; same shape as ids)
-      - time in hours (log1p)
-      - optional receptor features from baseline expression
-    Backward compatible: if batch only has a single integer 'condition',
-    we silently fall back to your existing condition embedding.
-    """
-    def __init__(self, n_cytokines: int, d_model: int, receptor_dim: int = 0):
+    def __init__(self, n_cytokines: int, d_model: int, receptor_dim: int = 0,
+                 padding_idx: int | None = None):
         super().__init__()
-        H = d_model  # keep everything in model dim for easy fusion
-        self.cyt = nn.Embedding(n_cytokines, H)
+        H = d_model
+
+        # If you choose Option A (pad at the end):
+        #   vocab_size = n_cytokines + 1, padding_idx = n_cytokines
+        # If you choose Option B (pad=0 and shift real ids +1), set vocab_size = n_cytokines + 1, padding_idx = 0
+        if padding_idx is None:
+            raise ValueError("CytokineConditioner requires a padding_idx (match your collate_fn).")
+
+        vocab_size = n_cytokines + 1 if padding_idx in (0, n_cytokines) else n_cytokines
+        self.padding_idx = padding_idx
+
+        self.cyt = nn.Embedding(vocab_size, H, padding_idx=padding_idx)
         self.dose_mlp = nn.Sequential(nn.Linear(1, H), nn.SiLU(), nn.Linear(H, H))
         self.time_mlp = nn.Sequential(nn.Linear(1, H), nn.SiLU(), nn.Linear(H, H))
-        self.rec_mlp = nn.Sequential(nn.Linear(receptor_dim, H), nn.SiLU(), nn.Linear(H, H)) if receptor_dim > 0 else None
+        self.rec_mlp  = (nn.Sequential(nn.Linear(receptor_dim, H), nn.SiLU(), nn.Linear(H, H))
+                         if receptor_dim > 0 else None)
         self.out = nn.LayerNorm(H)
 
     def forward(self, batch: dict, default_condition_emb: torch.Tensor = None):
-        """
-        Returns h_c (B, H).
-
-        Accepts either:
-          - rich fields: 'cytokine_ids' (B,Cmax), 'doses' (B,Cmax), 'time_hours' (B,), optional 'receptor_vec' (B,R)
-          - or falls back to default_condition_emb (your existing single condition embedding in CLS)
-        """
         if all(k in batch for k in ("cytokine_ids", "doses", "time_hours")):
-            ids   = batch["cytokine_ids"]        # (B, Cmax)
-            doses = batch["doses"].unsqueeze(-1) # (B, Cmax, 1)  expected log10-scale
-            t     = batch["time_hours"].unsqueeze(-1)  # (B,1)
-            c_emb = self.cyt(ids)                        # (B, Cmax, H)
-            d_emb = self.dose_mlp(doses)                 # (B, Cmax, H)
-            pooled = (c_emb + d_emb).mean(dim=1)         # simple average; can swap for attention later
-            t_emb  = self.time_mlp(t).squeeze(1)         # (B,H)
-            h_c = pooled + t_emb
+            ids   = batch["cytokine_ids"]          # (B, Cmax), Long
+            doses = batch["doses"].unsqueeze(-1)   # (B, Cmax, 1), float
+            t     = batch["time_hours"].unsqueeze(-1)  # (B, 1), float
+
+            # Align dtype/device to first Linear weight (avoid AMP/dtype/device mismatches)
+            lin_w = self.dose_mlp[0].weight
+            ids   = ids.to(self.cyt.weight.device).long()
+            doses = doses.to(lin_w.device, dtype=lin_w.dtype)
+            t     = t.to(lin_w.device, dtype=lin_w.dtype)
+            doses = torch.nan_to_num(doses, nan=0.0, posinf=0.0, neginf=0.0)
+            t     = torch.nan_to_num(t,     nan=0.0, posinf=0.0, neginf=0.0)
+
+            c_emb = self.cyt(ids)               # (B, Cmax, H)
+            d_emb = self.dose_mlp(doses)        # (B, Cmax, H)
+            valid = (ids != self.padding_idx).float()  
+
+            # weights for masking embeddings
+            weights = valid.unsqueeze(-1)      
+
+            # masked sum over Cmax
+            pooled_sum = ((c_emb + d_emb) * weights).sum(dim=1)        # (B, H)
+
+            # sum of valid entries per sample, keep as (B,1) for clean broadcasting
+            denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)      # (B, 1)
+
+            # masked mean
+            pooled = pooled_sum / denom             
+
+            t_emb  = self.time_mlp(t).squeeze(1)                    # (B, H)
+            h_c    = pooled + t_emb
             if self.rec_mlp and ("receptor_vec" in batch):
-                h_c = h_c + self.rec_mlp(batch["receptor_vec"])
+                rec = batch["receptor_vec"].to(lin_w.device, dtype=lin_w.dtype)
+                rec = torch.nan_to_num(rec, nan=0.0, posinf=0.0, neginf=0.0)
+                h_c = h_c + self.rec_mlp(rec)
             return self.out(h_c)
-        else:
-            # Backward-compatible: use the (already-added) condition embedding in CLS
-            # If not provided, just return zeros so downstream add is a no-op.
-            return default_condition_emb if default_condition_emb is not None else 0.0
+
+        # Fallback (no rich cytokine fields)
+        if default_condition_emb is not None:
+            ref = self.dose_mlp[0].weight
+            x = default_condition_emb
+            if x.dim() == 1: x = x.unsqueeze(0)
+            x = x.to(ref.device, dtype=ref.dtype)
+            return self.out(x)
+        ref = self.dose_mlp[0].weight
+        return self.out(torch.zeros(1, self.cyt.embedding_dim, device=ref.device, dtype=ref.dtype))
 
 class PerturbationHead(nn.Module):
     """
@@ -413,8 +439,9 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
     num_batches = 0 
     for batch in dataloader:
         # Move each part of the batch to the device.
-        for key in batch:
-            batch[key] = batch[key].to(device)
+        for k, v in list(batch.items()):
+            if torch.is_tensor(v):
+                batch[k] = v.to(device, non_blocking=True)
         # Create an input copy where the selected positions are replaced by MASK_TOKEN_ID
         current_expression_tokens = batch['expression_tokens'].clone()
         current_gene_id_tokens = batch["gene_ids"].clone()
@@ -435,6 +462,8 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
             masked_input["gene_ids"][mask_positions] = mask_token_id
             masked_logits, whole_genome_logits, cls_token, domain_preds, gene_id_logits = ddp_model(masked_input)
             # Compute loss only on the masked positions
+            if mask_positions.sum() == 0:
+                loss_masked = masked_logits.sum() * 0.0  # zero, but connected graph
             if mask_positions.sum() > 0:
                 loss_masked = mse_loss_for_expression(masked_logits[mask_positions], input_expression_tokens[mask_positions], ignore_index=pad_token_id)
                 loss_gene_id = F.cross_entropy(gene_id_logits[mask_positions], input_gene_id_tokens[mask_positions],ignore_index=pad_token_id)
