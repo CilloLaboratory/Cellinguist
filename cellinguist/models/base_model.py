@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from flash_attn.flash_attn_interface import flash_attn_func
-from .loss import compute_similarity_loss, mse_loss_for_expression
+from .loss import compute_similarity_loss, mse_loss_for_expression, hurdle_nb_loss
 import torch.nn.functional as F
 
 class TokenEmbeddingLayer(nn.Module):
@@ -505,7 +505,19 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
             masked_input['gene_ids'] = current_gene_id_tokens.clone()
             masked_input['expression_tokens'][mask_positions] = mask_token_id
             masked_input["gene_ids"][mask_positions] = mask_token_id
-            masked_logits, whole_genome_logits, cls_token, domain_preds, gene_id_logits = ddp_model(masked_input)
+            masked_logits, whole_genome_tuple, cls_token, domain_preds, gene_id_logits = ddp_model(masked_input)
+            logit_p_nz, log_mu, log_theta = whole_genome_tuple
+            # targets prepared by collate_fn_unified
+            y_counts = batch["whole_genome_counts"]
+            is_nz    = batch["whole_genome_is_nonzero"]  # uint8/bool
+            # Compute loss on genome 
+            loss_genome = hurdle_nb_loss(
+                logit_p_nz, log_mu, log_theta,
+                y=y_counts, is_nz=is_nz,
+                mask=None,               # or a (B,G) mask if you sometimes subset genes
+                focal_gamma=1.0,         # try 0.0 or 1.0; 1.0 often helps with zero-heavy genes
+                pos_weight=None          # or a tensor of shape (G,) if you want per-gene positive weighting
+            )
             # Compute loss only on the masked positions
             if mask_positions.sum() == 0:
                 loss_masked = masked_logits.sum() * 0.0  # zero, but connected graph
@@ -515,8 +527,6 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
             else:
                 loss_masked = torch.tensor(0.0, device=device)
                 loss_gene_id = torch.tensor(0.0, device=device)
-            # Compute loss on genome 
-            loss_genome = mse_loss_for_expression(whole_genome_logits, batch["whole_genome_target"], ignore_index=pad_token_id)
             loss_similarity = compute_similarity_loss(cls_token, threshold = 0.9)
             # Compute a domain classification loss (e.g., cross-entropy) using the domain labels:
             loss_domain = F.cross_entropy(domain_preds, batch['domain'])
