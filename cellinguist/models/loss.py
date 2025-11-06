@@ -102,3 +102,123 @@ def knn_laplacian_loss(embeddings: torch.Tensor,
 
     # 4) Average over all (i, j) pairs
     return diff_sq.mean()
+
+# ===== Hurdle NB(+) loss for whole-genome counts =====
+import math
+
+def _log1mexp(x: torch.Tensor) -> torch.Tensor:
+    """
+    Stable log(1 - exp(x)) for x <= 0.
+    """
+    # Split at log(0.5) for numerical stability
+    log_half = -math.log(2.0)
+    out = torch.empty_like(x)
+    mask = x < log_half  # use log1p(-exp(x)) when far from 0
+    out[mask] = torch.log1p(-torch.exp(x[mask]))
+    out[~mask] = torch.log(-torch.expm1(x[~mask]))
+    return out
+
+def _nb_logpmf(y: torch.Tensor, mu: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+    """
+    Negative Binomial log PMF with mean mu and dispersion theta (>0), where:
+      Var(Y) = mu + mu^2 / theta
+    Shapes:
+      y, mu: (B, G)
+      theta: (1, G) or (B, G) (broadcastable)
+    """
+    # Ensure floats
+    y = y.to(mu.dtype)
+    t = theta
+    return (
+        torch.lgamma(y + t) - torch.lgamma(t) - torch.lgamma(y + 1.0)
+        + t * (torch.log(t) - torch.log(t + mu))
+        + y * (torch.log(mu) - torch.log(t + mu))
+    )
+
+def hurdle_nb_loss(
+    logit_p_nz: torch.Tensor,     # (B, G) logits for P(y>0)
+    log_mu: torch.Tensor,         # (B, G) log mean (before size-factor already added)
+    log_theta: torch.Tensor,      # (G,)   gene-wise log-dispersion parameters
+    y: torch.Tensor,              # (B, G) integer counts
+    is_nz: torch.Tensor,          # (B, G) uint8/bool indicators (1 if y>0)
+    mask: torch.Tensor | None = None,  # (B, G) 1/0 for valid positions (optional)
+    focal_gamma: float = 0.0,     # set >0 (e.g., 1.0) to use focal BCE on zero-vs-nonzero
+    pos_weight: torch.Tensor | None = None,  # optional pos_weight for BCE, shape (G,) or scalar
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Two-part (hurdle) loss:
+      L = BCE( I[y>0], p_nz ) + I[y>0] * [ -log NB(y; mu, theta) + log(1 - NB(0; mu, theta)) ]
+    where NB(·) is the standard NB pmf and the second term is the truncated NB correction.
+
+    Notes:
+      - log_mu can include a size-factor offset upstream (recommended).
+      - theta = exp(log_theta) is broadcast gene-wise.
+      - Set focal_gamma>0 for focal-BCE (helps with heavy zero-imbalance).
+    """
+    # Types / shapes
+    B, G = log_mu.shape
+    device = log_mu.device
+    dtype = log_mu.dtype
+
+    # Probabilities and parameters
+    p_nz = torch.sigmoid(logit_p_nz)                  # (B, G)
+    mu   = torch.exp(log_mu).clamp_min(eps)           # (B, G)
+    theta= torch.exp(log_theta).reshape(1, -1)        # (1, G) broadcast to (B, G)
+
+    # ----- BCE (optionally focal) for zero vs nonzero -----
+    target = is_nz.to(dtype)
+    if focal_gamma > 0.0:
+        # Focal BCE: -(1-p_t)^γ * log(p_t), with p_t = p if y=1 else (1-p)
+        pt = torch.where(target > 0.5, p_nz, 1.0 - p_nz).clamp(min=eps, max=1.0 - eps)
+        bce_elem = -((1.0 - pt).pow(focal_gamma)) * torch.log(pt)
+        # optional class weighting
+        if pos_weight is not None:
+            # scale positives by pos_weight
+            w = torch.ones_like(bce_elem)
+            if pos_weight.numel() == 1:
+                w = torch.where(target > 0.5, pos_weight.to(dtype), w)
+            else:
+                w = torch.where(target > 0.5, pos_weight.to(dtype).reshape(1, -1).expand_as(target), w)
+            bce_elem = bce_elem * w
+    else:
+        # Standard BCE with optional pos_weight
+        if pos_weight is not None:
+            # F.binary_cross_entropy_with_logits would take logits; we have p already, so do manual BCE:
+            p = p_nz.clamp(min=eps, max=1.0 - eps)
+            w_pos = pos_weight.to(dtype)
+            if w_pos.numel() == 1:
+                w = torch.where(target > 0.5, w_pos, torch.ones_like(p))
+            else:
+                w = torch.where(target > 0.5, w_pos.reshape(1, -1).expand_as(target), torch.ones_like(p))
+            bce_elem = -(w * target * torch.log(p) + (1.0 - target) * torch.log(1.0 - p))
+        else:
+            # Use logits path for best stability
+            bce_elem = F.binary_cross_entropy_with_logits(
+                logit_p_nz, target, reduction='none'
+            )
+
+    # ----- NB+ (truncated) for positive counts -----
+    y_float = y.to(dtype)
+    log_nb_y = _nb_logpmf(y_float, mu, theta.expand_as(mu))       # (B, G)
+    log_nb_0 = _nb_logpmf(torch.zeros_like(mu), mu, theta.expand_as(mu))  # (B, G)
+    # -log P(Y=y | Y>0) = -[log NB(y) - log(1 - NB(0))]
+    # use stable log(1 - NB(0)) = log1mexp(log_nb_0)
+    log_1m_nb0 = _log1mexp(log_nb_0.clamp_max(0.0))
+    nb_trunc = -(log_nb_y - log_1m_nb0)
+
+    # apply only to positive observations
+    pos_mask = is_nz.bool()
+    nb_term = torch.where(pos_mask, nb_trunc, torch.zeros_like(nb_trunc))
+
+    # ----- Combine and reduce -----
+    loss_elem = bce_elem + nb_term  # (B, G)
+
+    if mask is not None:
+        loss_elem = loss_elem * mask.to(dtype)
+        denom = mask.to(dtype).sum().clamp_min(1.0)
+    else:
+        denom = torch.tensor(loss_elem.numel(), device=device, dtype=dtype).clamp_min(1.0)
+
+    return loss_elem.sum() / denom
+    
