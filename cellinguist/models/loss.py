@@ -145,7 +145,8 @@ def hurdle_nb_loss(
     focal_gamma: float = 0.0,     # set >0 (e.g., 1.0) to use focal BCE on zero-vs-nonzero
     pos_weight: torch.Tensor | None = None,  # optional pos_weight for BCE, shape (G,) or scalar
     eps: float = 1e-8,
-) -> torch.Tensor:
+    return_components : bool = False
+) -> torch.Tensor | tuple:
     """
     Two-part (hurdle) loss:
       L = BCE( I[y>0], p_nz ) + I[y>0] * [ -log NB(y; mu, theta) + log(1 - NB(0; mu, theta)) ]
@@ -162,9 +163,17 @@ def hurdle_nb_loss(
     dtype = log_mu.dtype
 
     # Probabilities and parameters
-    p_nz = torch.sigmoid(logit_p_nz)                  # (B, G)
-    mu   = torch.exp(log_mu).clamp_min(eps)           # (B, G)
-    theta= torch.exp(log_theta).reshape(1, -1)        # (1, G) broadcast to (B, G)
+    # ----- Params with guards -----
+    # Keep p_nz as logits for BCE stability; we'll use logits below.
+    p_nz = torch.sigmoid(logit_p_nz)
+
+    # Clamp log_mu to avoid exp under/overflow; 11 => exp(11) ~ 6e4 counts
+    log_mu = log_mu.clamp(min=-20.0, max=11.0)
+    mu = torch.exp(log_mu)  # (B, G)
+
+    # Use softplus to ensure theta > 0 without exploding
+    theta = F.softplus(log_theta, beta=1.0) + 1e-4     # (G,)
+    theta = theta.reshape(1, -1)                       # (1, G)
 
     # ----- BCE (optionally focal) for zero vs nonzero -----
     target = is_nz.to(dtype)
@@ -200,11 +209,23 @@ def hurdle_nb_loss(
 
     # ----- NB+ (truncated) for positive counts -----
     y_float = y.to(dtype)
-    log_nb_y = _nb_logpmf(y_float, mu, theta.expand_as(mu))       # (B, G)
-    log_nb_0 = _nb_logpmf(torch.zeros_like(mu), mu, theta.expand_as(mu))  # (B, G)
-    # -log P(Y=y | Y>0) = -[log NB(y) - log(1 - NB(0))]
-    # use stable log(1 - NB(0)) = log1mexp(log_nb_0)
-    log_1m_nb0 = _log1mexp(log_nb_0.clamp_max(0.0))
+    th = theta.expand_as(mu)
+
+    log_nb_y = _nb_logpmf(y_float, mu, th)                 # (B, G)
+    log_nb_0 = _nb_logpmf(torch.zeros_like(mu), mu, th)    # (B, G)
+
+    # Clamp log NB(0) strictly below 0 so log(1 - NB(0)) stays finite
+    tiny = 1e-8
+    max_log_nb0 = math.log(1.0 - tiny)  # ~ -1e-8
+    log_nb_0 = torch.minimum(
+        log_nb_0,
+        torch.tensor(max_log_nb0, device=log_nb_0.device, dtype=log_nb_0.dtype)
+    )
+
+    # Stable log(1 - NB(0)) using helper
+    log_1m_nb0 = _log1mexp(log_nb_0)                       # (B, G)
+
+    # Truncated NB negative log-likelihood, applied only when y>0
     nb_trunc = -(log_nb_y - log_1m_nb0)
 
     # apply only to positive observations
@@ -215,10 +236,20 @@ def hurdle_nb_loss(
     loss_elem = bce_elem + nb_term  # (B, G)
 
     if mask is not None:
-        loss_elem = loss_elem * mask.to(dtype)
-        denom = mask.to(dtype).sum().clamp_min(1.0)
+        w = mask.to(dtype)
+        loss      = (loss_elem * w).sum() / w.sum().clamp_min(1.0)
+        loss_bce  = (bce_elem * w).sum() / w.sum().clamp_min(1.0)
+        loss_nb   = (nb_term * w).sum() / w.sum().clamp_min(1.0)
     else:
-        denom = torch.tensor(loss_elem.numel(), device=device, dtype=dtype).clamp_min(1.0)
+        denom = torch.tensor(loss_elem.numel(), device=loss_elem.device, dtype=loss_elem.dtype).clamp_min(1.0)
+        loss      = loss_elem.sum() / denom
+        loss_bce  = bce_elem.sum()  / denom
+        loss_nb   = nb_term.sum()   / denom
 
-    return loss_elem.sum() / denom
-    
+    if torch.isnan(bce_elem).any() or torch.isinf(bce_elem).any() \
+        or torch.isnan(nb_term).any() or torch.isinf(nb_term).any():
+            raise FloatingPointError("NaN/Inf detected in hurdle loss components")
+
+    if return_components:
+        return loss, loss_bce, loss_nb
+    return loss

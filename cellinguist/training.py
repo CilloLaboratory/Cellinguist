@@ -210,6 +210,27 @@ def main():
         lr = 1e-4
     )
 
+    def get_model_obj(ddp_or_model):
+        return ddp_or_model.module if hasattr(ddp_or_model, "module") else ddp_or_model
+
+    model = get_model_obj(ddp_model)   # <- ddp_model must be the INSTANCE, not the factory function
+
+    decay, nodecay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        # no weight decay on biases, LayerNorm/BatchNorm weights, and log_theta
+        if p.ndim == 1 or name.endswith(".bias") or "whole_genome_head.log_theta" in name:
+            nodecay.append(p)
+        else:
+            decay.append(p)
+
+    optimizer = torch.optim.AdamW(
+        [{"params": decay, "weight_decay": 0.0},
+        {"params": nodecay, "weight_decay": 0.0}],
+        lr=1e-4,
+    )
+
     #optimizer = torch.optim.Adam(ddp_model.parameters(), lr=1e-4)
 
     # Optionally, if you use teacher forcing, define the number of iterations.

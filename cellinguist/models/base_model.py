@@ -3,6 +3,7 @@ import torch.nn as nn
 from flash_attn.flash_attn_interface import flash_attn_func
 from .loss import compute_similarity_loss, mse_loss_for_expression, hurdle_nb_loss
 import torch.nn.functional as F
+import math
 
 class TokenEmbeddingLayer(nn.Module):
     def __init__(self,
@@ -226,44 +227,45 @@ class WholeGenomeExpressionPredictionHead(nn.Module):
         return logits
     
 class WholeGenomeHurdleHead(nn.Module):
-    """
-    Outputs:
-      - logit_p_nz: (B, G) — logits for P(y>0)
-      - log_mu:     (B, G) — NB mean on log-scale (without offset)
-      - log_theta:  (G,)   — per-gene dispersion (learned)
-    Uses a factorized readout to avoid D→(G*V) explosion.
-    """
-    def __init__(self, d_model: int, total_gene_count: int, d_head: int = None):
+    def __init__(self, d_model: int, total_gene_count: int, d_head: int | None = None):
         super().__init__()
         H = d_head or d_model
         self.proj = nn.Linear(d_model, H)
+        self.ln   = nn.LayerNorm(H)  # add this
         self.Wz   = nn.Linear(H, H, bias=False)
         self.Wmu  = nn.Linear(H, H, bias=False)
         self.gene_table = nn.Embedding(total_gene_count, H)
         self.bias_z  = nn.Parameter(torch.zeros(total_gene_count))
         self.bias_mu = nn.Parameter(torch.zeros(total_gene_count))
-        self.log_theta = nn.Parameter(torch.zeros(total_gene_count))  # init theta≈1
+        self.log_theta = nn.Parameter(torch.zeros(total_gene_count))  # raw param; softplus in loss
+
+        # good inits to avoid huge logits at step 0
+        nn.init.normal_(self.gene_table.weight, mean=0.0, std=0.02)
+        nn.init.xavier_uniform_(self.proj.weight); nn.init.zeros_(self.proj.bias)
+        nn.init.xavier_uniform_(self.Wz.weight);   nn.init.xavier_uniform_(self.Wmu.weight)
+        with torch.no_grad():
+            self.bias_mu.fill_(-2.0)  # ~ e^-2 ≈ 0.135 baseline before size offset
+            self.bias_z.fill_(-1.5)   # logit ≈ -1.5 -> p≈0.18
 
     def forward(self, cls_token: torch.Tensor, log_size: torch.Tensor | None = None):
-        """
-        cls_token: (B, d_model)
-        log_size:  (B,) or None — if provided, added as offset to log_mu
-        """
-        B = cls_token.size(0)
-        G = self.gene_table.num_embeddings
+        q = self.proj(cls_token)      # (B, H)
+        q = self.ln(q)                # LayerNorm helps a lot
 
-        q = self.proj(cls_token)           # (B, H)
-        zq = self.Wz(q)                    # (B, H)
-        muq = self.Wmu(q)                  # (B, H)
+        z_feat = self.Wz(q)           # (B, H)
+        mu_feat = self.Wmu(q)         # (B, H)
 
-        Gtab = self.gene_table.weight      # (G, H)
+        Gtab = self.gene_table.weight # (G, H)
+        scale = 1.0 / math.sqrt(Gtab.size(1))  # √H scaling
 
-        logit_p_nz = torch.matmul(zq, Gtab.T) + self.bias_z         # (B, G)
-        log_mu     = torch.matmul(muq, Gtab.T) + self.bias_mu        # (B, G)
+        logit_p_nz = (z_feat @ Gtab.T) * scale + self.bias_z   # (B, G)
+        log_mu     = (mu_feat @ Gtab.T) * scale + self.bias_mu # (B, G)
         if log_size is not None:
-            log_mu = log_mu + log_size[:, None]                      # offset
+            log_mu = log_mu + log_size[:, None]
 
-        return logit_p_nz, log_mu, self.log_theta  # (B,G), (B,G), (G,)
+        # clamp at the source to keep debugs sane (still re-clamped in loss)
+        log_mu = log_mu.clamp(min=-20.0, max=11.0)
+
+        return logit_p_nz, log_mu, self.log_theta
 
 class MaskedGeneIDPredictionHead(nn.Module):
     def __init__(self, d_model: int, gene_vocab_size: int):
