@@ -123,7 +123,15 @@ class SingleCellDatasetUnified(Dataset):
             raw_counts = row[expressed_indices]
             expression_tokens = bin_expression_counts(raw_counts, num_expression_bins=self.num_expression_bins, reserved_tokens_count=self.reserved_tokens_count)
         # For whole genome prediction:
-        whole_genome_target = bin_expression_counts_full(row, num_expression_bins=self.num_expression_bins, reserved_tokens_count=self.reserved_tokens_count)
+        whole_genome_counts = row.astype(np.int64)                 # (G,)
+        whole_genome_is_nonzero = (row > 0).astype(np.uint8)       # (G,)
+        # size factor (median over dataset computed once in __init__)
+        log_size_factor = float(np.log1p(row.sum()) - self._median_log1p_sum)
+
+        # in __init__, precompute dataset-wide median log library for offset
+        row_sums = self.expression_matrix.sum(axis=1)
+        self._median_log1p_sum = float(np.median(np.log1p(row_sums)))
+
         # Compute library size (number of expressed genes)
         library_size = len(expressed_indices)
         # Global binning: use precomputed global edges if available
@@ -145,7 +153,9 @@ class SingleCellDatasetUnified(Dataset):
         sample = {
             "gene_ids": gene_ids,                 # For masked prediction.
             "expression_tokens": expression_tokens,  # For masked prediction.
-            "whole_genome_target": whole_genome_target,  # For whole genome prediction.
+            "whole_genome_counts": whole_genome_counts,               # (G,)
+            "whole_genome_is_nonzero": whole_genome_is_nonzero,       # (G,)
+            "log_size_factor": log_size_factor, 
             "condition": condition,               # Cell-level condition label.
             "library_size": library_bin,           # Global library size bin.
             "domain": domain,          # Domain label for gradient reversal.
@@ -211,6 +221,10 @@ def collate_fn_unified(samples, cls_token_id: int, pad_token_id: int, cytokine_p
     doses_batch = []
     time_hours_batch = []
     receptor_batch = []
+    whole_counts = []
+    whole_is_nz = []
+    log_sf = []
+
     for sample in samples:
         # Prepend [CLS] to gene_ids.
         gene_ids = [cls_token_id] + sample["gene_ids"]
@@ -247,6 +261,11 @@ def collate_fn_unified(samples, cls_token_id: int, pad_token_id: int, cytokine_p
     whole_genome_targets = torch.stack(whole_genome_targets, dim=0)
     library_bins = torch.tensor(library_sizes, dtype=torch.long)
 
+    # New appraoch for whole genome hurdle model 
+    whole_counts = torch.stack([torch.tensor(s["whole_genome_counts"], dtype=torch.long) for s in samples], dim=0)
+    whole_is_nz  = torch.stack([torch.tensor(s["whole_genome_is_nonzero"], dtype=torch.uint8) for s in samples], dim=0)
+    log_sf       = torch.tensor([s["log_size_factor"] for s in samples], dtype=torch.float)
+
     batch = {
         "gene_ids": padded_gene_ids,             # (batch_size, max_seq_len)
         "expression_tokens": padded_expr_tokens,   # (batch_size, max_seq_len)
@@ -257,6 +276,9 @@ def collate_fn_unified(samples, cls_token_id: int, pad_token_id: int, cytokine_p
         "cytokine_ids": cytokine_ids_padded,   # (B, Cmax)  Long
         "doses": doses_padded,                 # (B, Cmax)  Float
         "time_hours": time_hours_tensor,       # (B,)       Float
+        "whole_genome_counts": whole_counts,          # (B, G) long
+        "whole_genome_is_nonzero": whole_is_nz,       # (B, G) uint8/bool
+        "log_size_factor": log_sf,  
     }
 
     return batch
