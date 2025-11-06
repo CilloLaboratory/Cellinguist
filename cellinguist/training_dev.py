@@ -14,9 +14,9 @@ from scipy.sparse import csr_matrix
 import numpy as np
 import anndata as ad
 import torch.distributed as dist
-from cellinguist.models.loss import mse_loss_for_expression, compute_similarity_loss
+from cellinguist.models.loss import mse_loss_for_expression, compute_similarity_loss, hurdle_nb_loss
 from cellinguist.data.data_funcs import SingleCellDatasetUnified, collate_fn_unified
-from cellinguist.models.base_model import TokenEmbeddingLayer, FlashTransformerEncoderLayer, MaskedGeneExpressionPredictionHead, MaskedGeneIDPredictionHead, WholeGenomeExpressionPredictionHead, DomainClassifier, FullModel, get_random_mask_positions, train_epoch_ddp, CytokineConditioner, PerturbationHead
+from cellinguist.models.base_model import TokenEmbeddingLayer, FlashTransformerEncoderLayer, MaskedGeneExpressionPredictionHead, MaskedGeneIDPredictionHead, WholeGenomeHurdleHead, DomainClassifier, FullModel, get_random_mask_positions, train_epoch_ddp, CytokineConditioner, PerturbationHead
 
 ## Load anndata
 dat = ad.read_h5ad('/home/arc85/Desktop/Cellinguist/cytokine_dictionary_pbs_ifng_2k_251103.h5ad')
@@ -95,10 +95,10 @@ masked_gene_head = MaskedGeneIDPredictionHead(
     gene_vocab_size=gene_vocab_size
 ).to(device)
 
-whole_genome_head = WholeGenomeExpressionPredictionHead(
+whole_genome_head = WholeGenomeHurdleHead(
     d_model=512,
     total_gene_count=num_of_genes,
-    expression_vocab_size=expression_vocab_size
+    d_head=512
 ).to(device)
     
 ## Domain classifier
@@ -129,6 +129,36 @@ full_model = FullModel(token_embedding_layer,
 optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, full_model.parameters()),
         lr = 1e-4
+)
+
+def get_model_obj(ddp_or_model):
+    return ddp_or_model.module if hasattr(ddp_or_model, "module") else ddp_or_model
+
+model = get_model_obj(full_model)   # <- ddp_model must be the INSTANCE, not the factory function
+lt = model.whole_genome_head.log_theta
+print("requires_grad:", lt.requires_grad, "shape:", tuple(lt.shape))
+
+names = set()
+for pg in optimizer.param_groups:
+    for p in pg['params']:
+        if p is model.modules.whole_genome_head.log_theta:
+            names.add('log_theta_found')
+print("[debug] log_theta in optimizer:", 'log_theta_found' in names)
+
+decay, nodecay = [], []
+for name, p in model.named_parameters():
+    if not p.requires_grad:
+        continue
+    # no weight decay on biases, LayerNorm/BatchNorm weights, and log_theta
+    if p.ndim == 1 or name.endswith(".bias") or "whole_genome_head.log_theta" in name:
+        nodecay.append(p)
+    else:
+        decay.append(p)
+
+optimizer = torch.optim.AdamW(
+    [{"params": decay, "weight_decay": 0.0},
+     {"params": nodecay, "weight_decay": 0.0}],
+    lr=1e-4,
 )
 
     # Optionally, if you use teacher forcing, define the number of iterations.
@@ -215,11 +245,19 @@ def run_one_batch_debug(
     pad_token_id: int,
     mask_fraction: float = 0.15,
     num_iterative_steps: int = 1,
-    amp_enabled: bool = False,  # force False for debugging
+    amp_enabled: bool = False,  # keep False for debugging
     loss_weights = None,
 ):
-    loss_weights = loss_weights or dict(masked=0.005, genome=0.05, presence=1.0, posbins=1.0,
-                                        similarity=2.0, domain=5.0, gene_id=5.0)
+    import torch
+    import torch.nn.functional as F
+    from contextlib import nullcontext
+    from cellinguist.models.loss import mse_loss_for_expression, compute_similarity_loss, hurdle_nb_loss
+
+    # include a weight for the hurdle genome loss
+    loss_weights = loss_weights or dict(
+        masked=0.005, genome=0.20,  # <-- turn on genome weight
+        similarity=2.0, domain=5.0, gene_id=5.0
+    )
 
     # fetch one batch
     it = iter(dataloader)
@@ -241,127 +279,112 @@ def run_one_batch_debug(
 
     # build mask once per outer step
     mask_positions = get_random_mask_positions(current_expression_tokens, mask_token_id, mask_fraction)
-    # don’t mask PADs
     mask_positions &= (current_expression_tokens != pad_token_id)
 
     # masked inputs
-    masked_input = dict(batch)  # shallow copy OK (we replace only 2 tensors)
-    input_expression_tokens = current_expression_tokens.clone()
-    input_gene_id_tokens    = current_gene_id_tokens.clone()
-
+    masked_input = dict(batch)  # shallow copy OK
     masked_input['expression_tokens'] = current_expression_tokens.clone()
     masked_input['gene_ids']          = current_gene_id_tokens.clone()
     masked_input['expression_tokens'][mask_positions] = mask_token_id
     masked_input['gene_ids'][mask_positions]          = mask_token_id
 
-    # helpful extra prints for conditioner
     _print_conditioner_inputs(masked_input, ddp_model.module if hasattr(ddp_model, "module") else ddp_model)
 
-    # choose context (disable AMP for debugging)
-    ctx = nullcontext()
-    if amp_enabled:
-        ctx = torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32)
-
+    ctx = nullcontext()  # disable AMP for clarity
     try:
         with ctx:
             outs = ddp_model(masked_input)
 
-        # Support both forward signatures:
-        if isinstance(outs, (list, tuple)) and len(outs) == 5:
-            masked_logits, whole_genome_logits, cls_token, domain_preds, gene_id_logits = outs
-            p_expr = pos_logits = None
-        elif isinstance(outs, (list, tuple)) and len(outs) == 6:
-            masked_logits, p_expr, pos_logits, cls_token, domain_preds, gene_id_logits = outs
-            whole_genome_logits = None
-        else:
-            raise RuntimeError(f"Unexpected forward() return of length {len(outs)}")
+        # Unpack the model outputs (new forward signature)
+        # masked_logits: (B, T, V)
+        # whole_genome_out: tuple(logit_p_nz[B,G], log_mu[B,G], log_theta[G])
+        # cls_token: (B, D)
+        # domain_preds: (B, Cdom)
+        # gene_id_logits: (B, T, Ngene)
+        masked_logits, whole_genome_out, cls_token, domain_preds, gene_id_logits = outs
 
-        # print shapes
-        def _sh(x, name):
-            if x is None: print(f"[forward] {name}: None")
-            elif torch.is_tensor(x): print(f"[forward] {name}: {tuple(x.shape)} {x.dtype} {x.device}")
-            else: print(f"[forward] {name}: type={type(x)}")
-        _sh(masked_logits, "masked_logits")
-        _sh(whole_genome_logits, "whole_genome_logits")
-        _sh(p_expr, "p_expr")
-        _sh(pos_logits, "pos_logits")
-        _sh(cls_token, "cls_token")
-        _sh(domain_preds, "domain_preds")
-        _sh(gene_id_logits, "gene_id_logits")
+        # -------- Hurdle loss (and components) --------
+        loss_genome = torch.tensor(0.0, device=device)
+        loss_presence = torch.tensor(0.0, device=device)  # BCE term
+        loss_posnb    = torch.tensor(0.0, device=device)  # NB+ term
 
-        # compute losses that are available
+        if isinstance(whole_genome_out, tuple) and len(whole_genome_out) == 3:
+            logit_p_nz, log_mu, log_theta = whole_genome_out  # (B,G), (B,G), (G,)
+
+            # sanity prints
+            print("[forward] whole_genome_out:",
+                  tuple(x.shape for x in (logit_p_nz, log_mu, log_theta)))
+            with torch.no_grad():
+                print("[debug] log_mu min/max:", float(log_mu.min().item()), float(log_mu.max().item()))
+                print("[debug] log_theta min/max:", float(log_theta.min().item()), float(log_theta.max().item()))
+
+            # targets
+            y_counts = batch["whole_genome_counts"]         # (B,G) long
+            is_nz    = batch["whole_genome_is_nonzero"]     # (B,G) bool/uint8
+
+            # compute stable hurdle loss; returns (total, bce, nb_trunc)
+            loss_genome, loss_presence, loss_posnb = hurdle_nb_loss(
+                logit_p_nz, log_mu, log_theta,
+                y=y_counts, is_nz=is_nz,
+                mask=None,
+                focal_gamma=1.0, pos_weight=None,
+                return_components=True
+            )
+
+        # -------- Masked modeling & gene-ID losses --------
         loss_masked = torch.tensor(0.0, device=device)
         loss_gene_id = torch.tensor(0.0, device=device)
-        loss_genome = torch.tensor(0.0, device=device)
-        L_presence = torch.tensor(0.0, device=device)
-        L_posbins  = torch.tensor(0.0, device=device)
-
         if mask_positions.any():
-            # MSE over masked positions for expression tokens (or adapt to your loss)
-            from cellinguist.models.loss import mse_loss_for_expression  # adjust import path if needed
             loss_masked = mse_loss_for_expression(
-                masked_logits[mask_positions], input_expression_tokens[mask_positions], ignore_index=pad_token_id
+                masked_logits[mask_positions], current_expression_tokens[mask_positions], ignore_index=pad_token_id
             )
             loss_gene_id = F.cross_entropy(
-                gene_id_logits[mask_positions], input_gene_id_tokens[mask_positions], ignore_index=pad_token_id
+                gene_id_logits[mask_positions], current_gene_id_tokens[mask_positions], ignore_index=pad_token_id
             )
 
-        # Whole-genome (old path): MSE to binned targets
-        if whole_genome_logits is not None and "whole_genome_target" in batch:
-            from cellinguist.models.loss import mse_loss_for_expression
-            loss_genome = mse_loss_for_expression(whole_genome_logits, batch["whole_genome_target"], ignore_index=pad_token_id)
-
-        # New presence/posbins heads (if available and targets present)
-        if (p_expr is not None) and ("wge_presence_target" in batch):
-            from cellinguist.models.loss import loss_presence_bce
-            L_presence = loss_presence_bce(p_expr, batch["wge_presence_target"], pos_weight=2.0)
-        if (pos_logits is not None) and ("wge_posbins_target" in batch):
-            from cellinguist.models.loss import loss_posbins_ce
-            L_posbins = loss_posbins_ce(pos_logits, batch["wge_posbins_target"], ignore_index=-100)
-
-        # similarity/domain
-        from cellinguist.models.loss import compute_similarity_loss
+        # -------- Similarity / domain --------
         loss_similarity = compute_similarity_loss(cls_token, threshold=0.9) if torch.is_tensor(cls_token) else torch.tensor(0.0, device=device)
         loss_domain = F.cross_entropy(domain_preds, batch['domain']) if torch.is_tensor(domain_preds) else torch.tensor(0.0, device=device)
 
-        # total (mix old/new heads if both active)
-        loss = (loss_weights["masked"] * loss_masked +
-                loss_weights["genome"] * loss_genome +
-                loss_weights["presence"] * L_presence +
-                loss_weights["posbins"] * L_posbins +
-                loss_weights["similarity"] * loss_similarity +
-                loss_weights["domain"] * loss_domain +
-                loss_weights["gene_id"] * loss_gene_id)
+        # -------- Total --------
+        loss = (
+            loss_weights["masked"] * loss_masked +
+            loss_weights["genome"] * loss_genome +
+            loss_weights["similarity"] * loss_similarity +
+            loss_weights["domain"] * loss_domain +
+            loss_weights["gene_id"] * loss_gene_id
+        )
 
-        print(f"\n[losses] masked={loss_masked.item():.4f} genome={loss_genome.item():.4f} "
-              f"presence={L_presence.item():.4f} posbins={L_posbins.item():.4f} "
+        # Log with hurdle components (presence/NB+) instead of old presence/posbins
+        print(f"\n[losses] masked={loss_masked.item():.4f} "
+              f"hurdle_total={loss_genome.item():.4f} presence_bce={loss_presence.item():.4f} nb_plus={loss_posnb.item():.4f} "
               f"similarity={loss_similarity.item():.4f} domain={loss_domain.item():.4f} "
               f"gene_id={loss_gene_id.item():.4f} | total={loss.item():.4f}")
 
-        # backward just to verify graph ok (can comment out while troubleshooting)
         optimizer.zero_grad(set_to_none=True)
+        # Avoid AMP here during debugging
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        # (optional) teacher forcing update for masked positions
+        # Optional teacher forcing update
         with torch.no_grad():
             probs = F.softmax(masked_logits, dim=-1)
             conf, _ = probs.max(dim=-1)
-            thresh = torch.quantile(conf[mask_positions], 0.8) if mask_positions.any() else 1.0
-            update_mask = mask_positions & (conf >= thresh)
-            pred_tokens = masked_logits.argmax(dim=-1)
-            current_expression_tokens[update_mask] = pred_tokens[update_mask]
-            current_expression_tokens = current_expression_tokens.detach()
+            if mask_positions.any():
+                thresh = torch.quantile(conf[mask_positions], 0.8)
+                update_mask = mask_positions & (conf >= thresh)
+                pred_tokens = masked_logits.argmax(dim=-1)
+                current_expression_tokens[update_mask] = pred_tokens[update_mask]
+                current_expression_tokens = current_expression_tokens.detach()
 
         return loss.item()
 
-    except Exception as e:
+    except Exception:
         print("\n[EXCEPTION] during one-batch debug:")
         traceback.print_exc()
-        # dump a couple of common culprits
         _print_conditioner_inputs(masked_input, ddp_model.module if hasattr(ddp_model, "module") else ddp_model)
-        print("[hint] Try --amp_dtype none, and verify doses/time dtype==float32, ids dtype==long, "
-              "and that dose_mlp first linear in_features matches doses last-dim (should be 1).")
+        print("[hint] Verify hurdle targets in batch: whole_genome_counts/is_nonzero/log_size_factor and forward returns a 3-tuple.")
         raise
 
 ddp_or_model = full_model # or plain model if not using DDP
