@@ -16,7 +16,7 @@ import anndata as ad
 import torch.distributed as dist
 from cellinguist.models.loss import mse_loss_for_expression, compute_similarity_loss
 from cellinguist.data.data_funcs import SingleCellDatasetUnified, collate_fn_unified
-from cellinguist.models.base_model import TokenEmbeddingLayer, FlashTransformerEncoderLayer, MaskedGeneExpressionPredictionHead, MaskedGeneIDPredictionHead, WholeGenomeExpressionPredictionHead, DomainClassifier, FullModel, get_random_mask_positions, train_epoch_ddp, CytokineConditioner, PerturbationHead
+from cellinguist.models.base_model import TokenEmbeddingLayer, FlashTransformerEncoderLayer, MaskedGeneExpressionPredictionHead, MaskedGeneIDPredictionHead, WholeGenomeHurdleHead, DomainClassifier, FullModel, get_random_mask_positions, train_epoch_ddp, CytokineConditioner, PerturbationHead
 
 def main():
 
@@ -154,10 +154,10 @@ def main():
         gene_vocab_size=gene_vocab_size
     ).to(device)
 
-    whole_genome_head = WholeGenomeExpressionPredictionHead(
+    whole_genome_head = WholeGenomeHurdleHead(
         d_model=args.prediction_domain_head_dim,
         total_gene_count=num_of_genes,
-        expression_vocab_size=expression_vocab_size
+        d_head=args.prediction_domain_head_dim  # reuse same dim
     ).to(device)
     
     ## Domain classifier
