@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
+import scipy.sparse as sp
 
 def bin_expression_counts(counts: np.ndarray, num_expression_bins: int, reserved_tokens_count: int):
     """
@@ -65,7 +66,7 @@ class SingleCellDatasetUnified(Dataset):
     """
     def __init__(
             self, 
-            expression_matrix: np.ndarray, 
+            expression_matrix: np.ndarray,
             num_library_bins: int, 
             num_expression_bins: int, 
             reserved_tokens_count: int, 
@@ -77,6 +78,15 @@ class SingleCellDatasetUnified(Dataset):
             receptor_matrix: np.ndarray | None = None
     ):
         self.expression_matrix = np.atleast_2d(np.asarray(expression_matrix))
+
+        # ---- Precompute library-size stats for hurdle head ----
+        # Row sums = total UMIs per cell
+        row_sums = self.expression_matrix.sum(axis=1).astype(np.float64)  # shape (N,)
+        # Median of log1p(library size) to use as baseline
+        self._median_log1p_sum = float(np.median(np.log1p(row_sums)))
+        # Cache per-cell log-size factors (log1p normalized by dataset median)
+        self._log_size_factors = np.log1p(row_sums) - self._median_log1p_sum  # shape (N,)
+
         if condition_labels is not None:
             self.condition_labels = np.atleast_1d(np.asarray(condition_labels))
         else:
@@ -126,7 +136,7 @@ class SingleCellDatasetUnified(Dataset):
         whole_genome_counts = row.astype(np.int64)                 # (G,)
         whole_genome_is_nonzero = (row > 0).astype(np.uint8)       # (G,)
         # size factor (median over dataset computed once in __init__)
-        log_size_factor = float(np.log1p(row.sum()) - self._median_log1p_sum)
+        log_size_factor = float(self._log_size_factors[idx])
 
         # in __init__, precompute dataset-wide median log library for offset
         row_sums = self.expression_matrix.sum(axis=1)
@@ -240,9 +250,9 @@ def collate_fn_unified(samples, cls_token_id: int, pad_token_id: int, cytokine_p
         if dom is None:
             dom = 0
         domain.append(dom)
-        whole_genome_targets.append(
-            torch.tensor(sample["whole_genome_target"], dtype=torch.long)
-        )
+        # whole_genome_targets.append(
+        #     torch.tensor(sample["whole_genome_target"], dtype=torch.long)
+        # )
         lib_size = sample.get("library_size")
         library_sizes.append(lib_size)
         cytokine_ids_batch.append(torch.tensor(sample["cytokine_ids"], dtype=torch.long))
@@ -258,7 +268,7 @@ def collate_fn_unified(samples, cls_token_id: int, pad_token_id: int, cytokine_p
     conditions = torch.tensor(conditions, dtype=torch.long)
     domain = torch.tensor(domain, dtype=torch.long)
     # Stack whole genome targets; they are assumed to be the same length (num_genes).
-    whole_genome_targets = torch.stack(whole_genome_targets, dim=0)
+    # whole_genome_targets = torch.stack(whole_genome_targets, dim=0)
     library_bins = torch.tensor(library_sizes, dtype=torch.long)
 
     # New appraoch for whole genome hurdle model 
