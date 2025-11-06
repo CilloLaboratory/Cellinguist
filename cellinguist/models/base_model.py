@@ -225,6 +225,46 @@ class WholeGenomeExpressionPredictionHead(nn.Module):
         logits = logits.view(-1, self.total_gene_count, self.expression_vocab_size)
         return logits
     
+class WholeGenomeHurdleHead(nn.Module):
+    """
+    Outputs:
+      - logit_p_nz: (B, G) — logits for P(y>0)
+      - log_mu:     (B, G) — NB mean on log-scale (without offset)
+      - log_theta:  (G,)   — per-gene dispersion (learned)
+    Uses a factorized readout to avoid D→(G*V) explosion.
+    """
+    def __init__(self, d_model: int, total_gene_count: int, d_head: int = None):
+        super().__init__()
+        H = d_head or d_model
+        self.proj = nn.Linear(d_model, H)
+        self.Wz   = nn.Linear(H, H, bias=False)
+        self.Wmu  = nn.Linear(H, H, bias=False)
+        self.gene_table = nn.Embedding(total_gene_count, H)
+        self.bias_z  = nn.Parameter(torch.zeros(total_gene_count))
+        self.bias_mu = nn.Parameter(torch.zeros(total_gene_count))
+        self.log_theta = nn.Parameter(torch.zeros(total_gene_count))  # init theta≈1
+
+    def forward(self, cls_token: torch.Tensor, log_size: torch.Tensor | None = None):
+        """
+        cls_token: (B, d_model)
+        log_size:  (B,) or None — if provided, added as offset to log_mu
+        """
+        B = cls_token.size(0)
+        G = self.gene_table.num_embeddings
+
+        q = self.proj(cls_token)           # (B, H)
+        zq = self.Wz(q)                    # (B, H)
+        muq = self.Wmu(q)                  # (B, H)
+
+        Gtab = self.gene_table.weight      # (G, H)
+
+        logit_p_nz = torch.matmul(zq, Gtab.T) + self.bias_z         # (B, G)
+        log_mu     = torch.matmul(muq, Gtab.T) + self.bias_mu        # (B, G)
+        if log_size is not None:
+            log_mu = log_mu + log_size[:, None]                      # offset
+
+        return logit_p_nz, log_mu, self.log_theta  # (B,G), (B,G), (G,)
+
 class MaskedGeneIDPredictionHead(nn.Module):
     def __init__(self, d_model: int, gene_vocab_size: int):
         super().__init__()
@@ -400,14 +440,19 @@ class FullModel(nn.Module):
             cls_token_for_genome = self.perturb_head(cls_token, h_c)
         else:
             cls_token_for_genome = cls_token
-        whole_genome_logits = self.whole_genome_head(cls_token_for_genome)
+        # whole_genome_logits = self.whole_genome_head(cls_token_for_genome)
+        # Hurdle model
+        logit_p_nz, log_mu, log_theta = self.whole_genome_head(
+        cls_token_for_genome,
+        log_size=batch.get("log_size_factor", None)
+        )
         # Gene id prediction
         gene_id_logits = self.gene_id_head(x)
         # Domain classification 
         reversed_embeddings = grad_reverse(cls_token, lambda_=self.lambda_value)
         # Forward pass through the domain classifer
         domain_preds = self.domain_classifier(reversed_embeddings)
-        return masked_logits, whole_genome_logits, cls_token_for_genome, domain_preds, gene_id_logits
+        return masked_logits, (logit_p_nz, log_mu, log_theta), cls_token_for_genome, domain_preds, gene_id_logits
     
 def get_random_mask_positions(token_tensor, mask_token_id: int, mask_fraction=0.2):
     """
