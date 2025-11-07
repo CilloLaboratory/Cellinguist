@@ -68,6 +68,29 @@ def main():
     dat = ad.read_h5ad(args.input_anndata)
     dense_matrix = dat.X.toarray()
 
+    # Per-gene prevalence π_g = P(y>0) across the TRAIN set
+    X = dat.X  # shape (N, G)
+    # If X can be sparse, convert row-wise boolean >0 safely:
+    try:
+        import scipy.sparse as sp
+        if sp.issparse(X):
+            pi_g = np.asarray((X > 0).mean(axis=0)).ravel().astype(np.float32)
+        else:
+            pi_g = (X > 0).mean(axis=0).astype(np.float32)
+    except Exception:
+        pi_g = (X > 0).mean(axis=0).astype(np.float32)
+
+    # Turn into BCE pos_weight = (1-π)/π with safety caps
+    pi_floor = 1e-4
+    pi_g = np.clip(pi_g, pi_floor, 1.0 - 1e-6)
+    pos_weight_np = (1.0 - pi_g) / pi_g
+    pos_weight_np = np.clip(pos_weight_np, 1.0, 50.0)  # cap extremes
+
+    # Stash as a torch Tensor (we’ll move to device at use-time)
+    pos_weight_train = torch.from_numpy(pos_weight_np)  # shape (G,)
+    print("[hurdle] pos_weight stats:",
+      float(pos_weight_train.min()), float(pos_weight_train.max()))
+
     ## Set gene ids and vocab size
     # gene_ids = dat.var.gene.to_numpy()
     # gene is in var in anndata - sometimes called features 
@@ -240,6 +263,7 @@ def main():
     NUM_EPOCHS = args.epochs
     
     for epoch in range(NUM_EPOCHS):
+        pos_weight_dev = pos_weight_train.to(device, non_blocking=True)
         sampler.set_epoch(epoch)  # shuffle dataset for distributed sampler
         if epoch == 2:
             for p in ddp_model.module.token_embedding_layer.expression_embeddings.parameters():
@@ -253,7 +277,7 @@ def main():
                 lr = 1e-4
             )
         avg_loss, loss_masked, loss_genome, loss_similarity, loss_domain, loss_gene_id = train_epoch_ddp(
-            dataloader, ddp_model, optimizer, device, num_iterative_steps=num_iterative_steps, mask_token_id=MASK_TOKEN_ID, pad_token_id=PAD_TOKEN_ID
+            dataloader, ddp_model, optimizer, device, num_iterative_steps=num_iterative_steps, mask_token_id=MASK_TOKEN_ID, pad_token_id=PAD_TOKEN_ID, pos_weight=pos_weight_dev
         )
         if local_rank == 0:
             print(f"Epoch {epoch+1}/{NUM_EPOCHS}, Average Loss: {avg_loss:.4f}, Expression Loss: {loss_masked:.4f}, Whole Genome Loss: {loss_genome:.4f}, Similarity Loss: {loss_similarity:4f}, Domain loss: {loss_domain:.4f}, Gene id loss: {loss_gene_id:.4f}")

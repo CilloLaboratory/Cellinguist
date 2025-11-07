@@ -467,7 +467,7 @@ def get_random_mask_positions(token_tensor, mask_token_id: int, mask_fraction=0.
     mask_positions = (random_tensor < mask_fraction) & not_masked
     return mask_positions
 
-def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int, pad_token_id: int, num_iterative_steps=3, mask_fraction=0.2):
+def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int, pad_token_id: int, num_iterative_steps=3, mask_fraction=0.2, pos_weight: torch.Tensor | None = None):
     """
     Trains the model for one epoch using an iterative masking strategy.
     
@@ -513,13 +513,16 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
             y_counts = batch["whole_genome_counts"]
             is_nz    = batch["whole_genome_is_nonzero"]  # uint8/bool
             # Compute loss on genome 
-            loss_genome = hurdle_nb_loss(
+            loss_hurdle_total, loss_presence_bce, loss_nb_plus = hurdle_nb_loss(
                 logit_p_nz, log_mu, log_theta,
                 y=y_counts, is_nz=is_nz,
                 mask=None,               # or a (B,G) mask if you sometimes subset genes
                 focal_gamma=1.0,         # try 0.0 or 1.0; 1.0 often helps with zero-heavy genes
-                pos_weight=None          # or a tensor of shape (G,) if you want per-gene positive weighting
+                pos_weight=pos_weight,          # or a tensor of shape (G,) if you want per-gene positive weighting
+                return_components=True
             )
+            BCE_WEIGHT = 0.2  # <— try 0.2 first; tune to 0.1–0.5
+            loss_hurdle_mixed = loss_nb_plus + BCE_WEIGHT * loss_presence_bce
             # Compute loss only on the masked positions
             if mask_positions.sum() == 0:
                 loss_masked = masked_logits.sum() * 0.0  # zero, but connected graph
@@ -533,7 +536,7 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
             # Compute a domain classification loss (e.g., cross-entropy) using the domain labels:
             loss_domain = F.cross_entropy(domain_preds, batch['domain'])
             # Combine losses
-            loss = 0.005*loss_masked + 0.05*loss_genome + 2.0*loss_similarity + 5.0*loss_domain + 5.0*loss_gene_id
+            loss = 0.1*loss_masked + 0.5*loss_hurdle_mixed + 2.0*loss_similarity + 0.5*loss_domain + 1.0*loss_gene_id
             loss.backward()
             optimizer.step()
             # Teacher forcing: Update the current expression tokens at masked positions with the model's predictions
@@ -559,4 +562,4 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
         num_batches += 1
     # Print loss 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-    return avg_loss, loss_masked, loss_genome, loss_similarity, loss_domain, loss_gene_id
+    return avg_loss, loss_masked, loss_hurdle_total, loss_similarity, loss_domain, loss_gene_id
