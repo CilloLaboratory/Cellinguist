@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 import anndata as ad
 from cellinguist.data.data_funcs import SingleCellDatasetUnified, collate_fn_unified
-from cellinguist.models.base_model import TokenEmbeddingLayer, FlashTransformerEncoderLayer, MaskedGeneExpressionPredictionHead, MaskedGeneIDPredictionHead, WholeGenomeExpressionPredictionHead, DomainClassifier, FullModel
+from cellinguist.models.base_model import TokenEmbeddingLayer, FlashTransformerEncoderLayer, MaskedGeneExpressionPredictionHead, MaskedGeneIDPredictionHead, WholeGenomeHurdleHead, DomainClassifier, FullModel, CytokineConditioner, PerturbationHead
 
 def main():
 
@@ -41,6 +41,29 @@ def main():
     dat = ad.read_h5ad(args.input_anndata)
     dense_matrix = dat.X.toarray()
 
+    # Per-gene prevalence π_g = P(y>0) across the TRAIN set
+    X = dat.X  # shape (N, G)
+    # If X can be sparse, convert row-wise boolean >0 safely:
+    try:
+        import scipy.sparse as sp
+        if sp.issparse(X):
+            pi_g = np.asarray((X > 0).mean(axis=0)).ravel().astype(np.float32)
+        else:
+            pi_g = (X > 0).mean(axis=0).astype(np.float32)
+    except Exception:
+        pi_g = (X > 0).mean(axis=0).astype(np.float32)
+
+    # Turn into BCE pos_weight = (1-π)/π with safety caps
+    pi_floor = 1e-4
+    pi_g = np.clip(pi_g, pi_floor, 1.0 - 1e-6)
+    pos_weight_np = (1.0 - pi_g) / pi_g
+    pos_weight_np = np.clip(pos_weight_np, 1.0, 50.0)  # cap extremes
+
+    # Stash as a torch Tensor (we’ll move to device at use-time)
+    pos_weight_train = torch.from_numpy(pos_weight_np)  # shape (G,)
+    print("[hurdle] pos_weight stats:",
+      float(pos_weight_train.min()), float(pos_weight_train.max()))
+
     ## Set gene ids and vocab size
     gene_ids = dat.var.gene.to_numpy()
     # gene_ids = dat.var.features.to_numpy()
@@ -55,8 +78,11 @@ def main():
     ## Set conditions (optional)
     if args.condition_data is not None:
         condition_labels = torch.tensor(dat.obs[args.condition_data].factorize()[0])
+        num_cytokines = len(set(dat.obs[args.condition_data].factorize()[0]))
+        CYTOKINE_PAD_TOKEN_ID = num_cytokines
     else:
         condition_labels = None
+        CYTOKINE_PAD_TOKEN_ID = 0
 
     ## Set other input parameters
     CLS_TOKEN_ID = args.reserved_cls_token
@@ -87,7 +113,7 @@ def main():
 
     ## Create dataset 
     dataset = SingleCellDatasetUnified(dense_matrix, condition_labels = condition_labels, domain_labels = seq_batch_ids, num_expression_bins = num_expression_bins, num_library_bins = NUM_LIBRARY_BINS, reserved_tokens_count = 3)
-    collate = partial(collate_fn_unified, cls_token_id=CLS_TOKEN_ID, pad_token_id=PAD_TOKEN_ID)
+    collate = partial(collate_fn_unified, cls_token_id=CLS_TOKEN_ID, pad_token_id=PAD_TOKEN_ID, cytokine_pad_token_id=CYTOKINE_PAD_TOKEN_ID)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collate, shuffle=False)
 
     ## Token embedding 
@@ -120,18 +146,27 @@ def main():
         gene_vocab_size=gene_vocab_size
     ).to(device)
 
-    whole_genome_head = WholeGenomeExpressionPredictionHead(
+    whole_genome_head = WholeGenomeHurdleHead(
         d_model=args.prediction_domain_head_dim,
         total_gene_count=num_of_genes,
-        expression_vocab_size=expression_vocab_size
+        d_head=args.prediction_domain_head_dim
     ).to(device)
     
     ## Domain classifier
     domain_classifier = DomainClassifier(input_dim=args.prediction_domain_head_dim, hidden_dim=256, num_domains=num_domains).to(device)
 
+    n_cytokines = 2  # for v1, reuse your factorized condition labels
+    conditioner = CytokineConditioner(n_cytokines=n_cytokines,
+                                      d_model=512,
+                                      receptor_dim=0,
+                                      padding_idx=CYTOKINE_PAD_TOKEN_ID).to(device)
+    perturb_head = PerturbationHead(d_model=512,
+                                    hidden=512,
+                                    use_film=True).to(device)
+
     # Combine components into a full model.
     # Assume FullModel is a module that takes the token embedding layer, encoder layers, and prediction heads.
-    full_model = FullModel(token_embedding_layer, flash_encoder_layers, masked_head, whole_genome_head, domain_classifier, masked_gene_head, lambda_value = args.grad_rev_lambda).to(device)
+    full_model = FullModel(token_embedding_layer, flash_encoder_layers, masked_head, whole_genome_head, domain_classifier, masked_gene_head, lambda_value = args.grad_rev_lambda, conditioner=conditioner, perturb_head=perturb_head).to(device)
     
     # Load the trained model checkpoint
     checkpoint = torch.load(args.in_model, map_location=device, weights_only=True)
@@ -146,8 +181,10 @@ def main():
 
     with torch.no_grad():
         for batch in dataloader:
-            for key in batch:
-                batch[key] = batch[key].to(device)
+        # Move each part of the batch to the device.
+            for k, v in list(batch.items()):
+                if torch.is_tensor(v):
+                    batch[k] = v.to(device, non_blocking=True)
             # Forward pass through the full model.
             _, _, cls_token, _, _ = full_model(batch)
             cell_embeddings = cls_token
