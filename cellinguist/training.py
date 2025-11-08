@@ -207,16 +207,6 @@ def main():
                            lambda_value = args.grad_rev_lambda,
                            conditioner=conditioner,
                            perturb_head=perturb_head)
-    
-    # Freeze expression embeddings for first epoch
-    for p in full_model.token_embedding_layer.expression_embeddings.parameters():
-        p.requires_grad = True
-
-    for p in full_model.masked_head.parameters():
-        p.requires_grad = True
-
-    for p in full_model.whole_genome_head.parameters():
-        p.requires_grad = True
 
     # Wrap the model with DistributedDataParallel.
     ddp_model = DDP(full_model.to(device), 
@@ -228,10 +218,12 @@ def main():
 
     # Create your dataset and distributed sampler.
     # Assume dataset and collate_fn_unified are defined.
+    NUM_EPOCHS = args.epochs
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, ddp_model.parameters()),
-        lr = 1e-4
+        lr = 3e-4, weight_decay=0.01
     )
+    schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
 
     def get_model_obj(ddp_or_model):
         return ddp_or_model.module if hasattr(ddp_or_model, "module") else ddp_or_model
@@ -248,34 +240,22 @@ def main():
         else:
             decay.append(p)
 
-    optimizer = torch.optim.AdamW(
-        [{"params": decay, "weight_decay": 0.0},
-        {"params": nodecay, "weight_decay": 0.0}],
-        lr=1e-4,
-    )
+    # optimizer = torch.optim.AdamW(
+    #     [{"params": decay, "weight_decay": 0.0},
+    #     {"params": nodecay, "weight_decay": 0.0}],
+    #     lr=1e-4,
+    # )
 
     #optimizer = torch.optim.Adam(ddp_model.parameters(), lr=1e-4)
 
     # Optionally, if you use teacher forcing, define the number of iterations.
     num_iterative_steps = args.num_iterative_steps
 
-    # Main training loop.
-    NUM_EPOCHS = args.epochs
+    # Main training loop
     
     for epoch in range(NUM_EPOCHS):
         pos_weight_dev = pos_weight_train.to(device, non_blocking=True)
         sampler.set_epoch(epoch)  # shuffle dataset for distributed sampler
-        if epoch == 2:
-            for p in ddp_model.module.token_embedding_layer.expression_embeddings.parameters():
-                p.requires_grad=True
-            for p in ddp_model.module.whole_genome_head.parameters():
-                p.requires_grad=True
-            for p in ddp_model.module.masked_head.parameters():
-                p.requires_grad=True
-            optimizer = torch.optim.Adam(
-                filter(lambda p: p.requires_grad, ddp_model.parameters()),
-                lr = 1e-4
-            )
         avg_loss, loss_masked, loss_genome, loss_similarity, loss_domain, loss_gene_id = train_epoch_ddp(
             dataloader, ddp_model, optimizer, device, num_iterative_steps=num_iterative_steps, mask_token_id=MASK_TOKEN_ID, pad_token_id=PAD_TOKEN_ID, pos_weight=pos_weight_dev
         )
