@@ -538,7 +538,7 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
             # Compute a domain classification loss (e.g., cross-entropy) using the domain labels:
             loss_domain = F.cross_entropy(domain_preds, batch['domain'])
             # Combine losses
-            loss = 0.002*loss_masked + 0.8*loss_hurdle_mixed + 10.0*loss_similarity + 1.0*loss_domain + 1.0*loss_gene_id
+            loss = 0.002*loss_masked + 2*loss_hurdle_mixed + 0*loss_similarity + 1.0*loss_domain + 1.0*loss_gene_id
             loss.backward()
             optimizer.step()
             # total_norm = torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), 1.0)
