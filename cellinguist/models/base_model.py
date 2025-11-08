@@ -4,6 +4,7 @@ from flash_attn.flash_attn_interface import flash_attn_func
 from .loss import compute_similarity_loss, mse_loss_for_expression, hurdle_nb_loss
 import torch.nn.functional as F
 import math
+import torch.distributed as dist
 
 class TokenEmbeddingLayer(nn.Module):
     def __init__(self,
@@ -263,6 +264,7 @@ class WholeGenomeHurdleHead(nn.Module):
             log_mu = log_mu + log_size[:, None]
 
         # clamp at the source to keep debugs sane (still re-clamped in loss)
+        logit_p_nz = logit_p_nz.clamp(-6.0, 6.0)
         log_mu = log_mu.clamp(min=-20.0, max=11.0)
 
         return logit_p_nz, log_mu, self.log_theta
@@ -517,7 +519,7 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
                 logit_p_nz, log_mu, log_theta,
                 y=y_counts, is_nz=is_nz,
                 mask=None,               # or a (B,G) mask if you sometimes subset genes
-                focal_gamma=1.0,         # try 0.0 or 1.0; 1.0 often helps with zero-heavy genes
+                focal_gamma=0,         # try 0.0 or 1.0; 1.0 often helps with zero-heavy genes
                 pos_weight=pos_weight,          # or a tensor of shape (G,) if you want per-gene positive weighting
                 return_components=True
             )
@@ -536,9 +538,14 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
             # Compute a domain classification loss (e.g., cross-entropy) using the domain labels:
             loss_domain = F.cross_entropy(domain_preds, batch['domain'])
             # Combine losses
-            loss = 0.1*loss_masked + 0.5*loss_hurdle_mixed + 2.0*loss_similarity + 0.5*loss_domain + 1.0*loss_gene_id
+            loss = 0.002*loss_masked + 0.8*loss_hurdle_mixed + 10.0*loss_similarity + 1.0*loss_domain + 1.0*loss_gene_id
             loss.backward()
             optimizer.step()
+            # total_norm = torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), 1.0)
+            # if step % 100 == 0 and dist.get_rank() == 0:
+            #     print(f"[grad] total_norm={float(total_norm):.3f} "
+            #     f"BCE={loss_presence_bce.item():.4f} NB+={loss_nb_plus.item():.4f} "
+            #     f"masked={loss_masked.item():.2f} gene_id={loss_gene_id.item():.2f}")
             # Teacher forcing: Update the current expression tokens at masked positions with the model's predictions
             with torch.no_grad():
                 probabilities = F.softmax(masked_logits, dim=-1)
