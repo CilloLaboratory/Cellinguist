@@ -7,9 +7,9 @@ import pandas as pd
 
 ## Load anndata
 # dat = ad.read_h5ad("/home/arc85/Desktop/scrnaseq_transformer/01_input/HD_PBMC_5prime_3prime_250603b.h5ad")
-dat = ad.read_h5ad("/home/arc85/Desktop/Cellinguist/skin_lung_mel_nsclc_full_ad_250806.h5ad")
-dat = dat[:, dat.var['hvf']==1]
-dat.write_h5ad("/home/arc85/Desktop/Cellinguist/skin_lung_mel_nsclc_full_ad_2k_250807.h5ad")
+dat = ad.read_h5ad("/home/arc85/Desktop/Cellinguist/cytokine_dictionary_2k_pbs_ifng_251108.h5ad")
+# dat = dat[:, dat.var['hvf']==1]
+# dat.write_h5ad("/home/arc85/Desktop/Cellinguist/skin_lung_mel_nsclc_full_ad_2k_250807.h5ad")
 # dat = ad.read_h5ad("/home/arc85/Desktop/scrnaseq_transformer/01_input/HNSCC_cd8_2k_250605.h5ad")
 dense_matrix = dat.X.toarray()
 
@@ -53,7 +53,7 @@ with torch.no_grad():
 # torch.save(gene_embed_layer.weight.data.cpu(), "HNSCC_cd8_gene_embeddings_250605.pth")
 # torch.save(gene_embed_layer.weight.data.cpu(), "HNSCC_overall_gene_embeddings_250729.pth")
 # torch.save(gene_embed_layer.weight.data.cpu(), "sorted_test_train_gene_embeddings_250805.pth")
-torch.save(gene_embed_layer.weight.data.cpu(), "skin_lung_mel_nsclc_gene_embeddings_250807.pth")
+torch.save(gene_embed_layer.weight.data.cpu(), "cytokine_dict_warm_start_pbs_ifng_gene_embeddings_251108.pth")
 
 ## Later in a new session:
 # loaded_tensor = torch.load("gene_embeddings.pth",weights_only=True)  # yields a torch.Tensor of shape (total_tokens, emb_dim)
