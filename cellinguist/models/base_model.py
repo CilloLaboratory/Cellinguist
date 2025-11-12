@@ -469,6 +469,46 @@ def get_random_mask_positions(token_tensor, mask_token_id: int, mask_fraction=0.
     mask_positions = (random_tensor < mask_fraction) & not_masked
     return mask_positions
 
+def get_dynamic_mask_positions(
+    expression_tokens: torch.Tensor,   # (B, L) int64
+    *, 
+    pad_token_id: int,
+    reserved_tokens: int = 3,          # [CLS]=0, [PAD]=1, [MASK]=2
+    frac: float = 0.15
+) -> torch.Tensor:
+    """
+    Returns a boolean mask (B, L) selecting ~15% of *expressed* tokens per cell.
+    Expressed = token >= reserved_tokens (i.e., a real expression bin), and != PAD.
+    """
+    B, L = expression_tokens.shape
+    device = expression_tokens.device
+
+    valid_expr = (expression_tokens >= reserved_tokens) & (expression_tokens != pad_token_id)  # (B, L)
+    # count per row
+    counts = valid_expr.sum(dim=1)  # (B,)
+    # how many to pick per row (at least 1 when there is any valid expr)
+    k_per_row = torch.clamp((counts.float() * frac).ceil().to(torch.int64), min=0, max=L)
+
+    # random scores per position (mask invalid as -inf so they won't be picked)
+    scores = torch.rand(B, L, device=device)
+    scores = scores.masked_fill(~valid_expr, float("-inf"))
+
+    # topk selection per row (works even when k=0)
+    # torch.topk requires k>=1; guard rows with k=0
+    mask = torch.zeros(B, L, dtype=torch.bool, device=device)
+    # rows needing selection
+    rows = torch.nonzero(k_per_row > 0, as_tuple=False).flatten()
+    if rows.numel() > 0:
+        kmax = int(k_per_row[rows].max().item())
+        # get top-kmax for those rows, then trim per-row to k_per_row[i]
+        vals, idxs = torch.topk(scores[rows], k=kmax, dim=1)
+        for j, r in enumerate(rows.tolist()):
+            kj = int(k_per_row[r].item())
+            if kj > 0:
+                cols = idxs[j, :kj]
+                mask[r, cols] = True
+    return mask
+
 def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int, pad_token_id: int, num_iterative_steps=3, mask_fraction=0.2, pos_weight: torch.Tensor | None = None):
     """
     Trains the model for one epoch using an iterative masking strategy.
@@ -497,10 +537,12 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
         optimizer.zero_grad()
         for step in range(num_iterative_steps): 
             # Update the batch dictionary with the current expression tokens.
-            mask_positions = get_random_mask_positions(current_expression_tokens,
-                                                       mask_token_id, 
-                                                       mask_fraction
-                                                       )
+            mask_positions = get_dynamic_mask_positions(
+                current_expression_tokens,
+                pad_token_id=PAD_TOKEN_ID,
+                reserved_tokens=3,
+                frac=0.15
+            )
             # (The rest of the batch remains unchanged.)
             input_expression_tokens = current_expression_tokens.clone()
             input_gene_id_tokens = current_gene_id_tokens.clone()
