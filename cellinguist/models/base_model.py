@@ -529,7 +529,7 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
             if mask_positions.sum() == 0:
                 loss_masked = masked_logits.sum() * 0.0  # zero, but connected graph
             if mask_positions.sum() > 0:
-                loss_masked = mse_loss_for_expression(masked_logits[mask_positions], input_expression_tokens[mask_positions], ignore_index=pad_token_id)
+                loss_masked = mse_loss_for_expression(masked_logits, input_expression_tokens, ignore_index=[0,1,2])
                 loss_gene_id = F.cross_entropy(gene_id_logits[mask_positions], input_gene_id_tokens[mask_positions],ignore_index=pad_token_id)
             else:
                 loss_masked = torch.tensor(0.0, device=device)

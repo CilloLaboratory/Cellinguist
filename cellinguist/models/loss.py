@@ -42,35 +42,56 @@ def compute_similarity_loss(cell_embeddings: torch.Tensor, threshold: float = 0.
 
     return loss
 
-def mse_loss_for_expression(logits: torch.Tensor, target: torch.Tensor, ignore_index: int):
+def mse_loss_for_expression(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    ignore_index: int,
+    reserved_tokens: int = 3,          # CLS, PAD, MASK count
+    bin_values: torch.Tensor | None = None,
+    temperature: float = 1.0           # optional softmax temp
+) -> torch.Tensor:
     """
-    Computes an MSE loss for a prediction task where the model outputs logits over discrete bins,
-    and we wish to compute the expected value of the distribution.
+    Expected-value MSE over *valid expression bins only* (excludes reserved tokens),
+    with bin values mapped to a continuous target space.
 
-    Args:
-        logits (torch.Tensor): Tensor of shape (B, L, EXPRESSION_VOCAB_SIZE).
-        target (torch.Tensor): Tensor of shape (B, L) containing target bin indices.
-        ignore_index (int): Token value to ignore (e.g. PAD_TOKEN_ID).
-    
-    Returns:
-        torch.Tensor: Scalar MSE loss.
+    logits: [..., V]
+    target: [...] (same leading dims), contains bin ids including reserved tokens
     """
-    # Convert logits to probabilities along the last dimension.
-    probs = F.softmax(logits, dim=-1)  # (B, L, EXPRESSION_VOCAB_SIZE)
-    # Create a vector of bin indices. These are our "labels" in continuous form.
-    # For instance, if EXPRESSION_VOCAB_SIZE is 131, then bins will be [0, 1, 2, ..., 130].
-    # (If you reserved certain indices for special tokens, you may want to shift these values accordingly.)
-    bins = torch.arange(0, logits.size(-1), device=logits.device).float()  # (EXPRESSION_VOCAB_SIZE,)
-    # Compute the expected value: weighted sum of bins using the probabilities.
-    # This yields a tensor of shape (B, L).
-    expected = torch.sum(probs * bins, dim=-1)
-    # Convert target to float.
-    target_float = target.float()
-    # Create a mask to ignore positions with ignore_index.
-    valid_mask = target != ignore_index
-    # Compute mean squared error only over valid positions.
-    loss = F.mse_loss(expected[valid_mask], target_float[valid_mask])
-    return loss
+    V = logits.size(-1)
+    E = V - reserved_tokens            # number of real expression bins
+
+    # 1) Exclude reserved tokens from the distribution
+    logits = logits.clone()
+    logits[..., :reserved_tokens] = -1e9
+
+    # 2) Softmax (optionally with temperature)
+    probs = F.softmax(logits / temperature, dim=-1)          # [..., V]
+    probs_expr = probs[..., reserved_tokens:]                # [..., E]
+
+    # 3) Define numeric bin values (centers), not raw 0..E-1 indices if you have them
+    if bin_values is None:
+        # simplest: centers at 0..E-1 (float)
+        bin_values = torch.arange(E, device=logits.device, dtype=logits.dtype)
+    else:
+        bin_values = bin_values.to(device=logits.device, dtype=logits.dtype)  # [..., E] or (E,)
+
+    # 4) Expected value over *expression* bins
+    expected = (probs_expr * bin_values).sum(dim=-1)         # [...]
+
+    # 5) Targets: shift away reserved tokens and mask invalids
+    target_adj = (target - reserved_tokens).to(expected.dtype)     # [...]
+    valid_mask = (
+        (target != ignore_index) &
+        (target_adj >= 0) &
+        (target_adj < E)
+    )
+
+    if valid_mask.any():
+        return F.mse_loss(expected[valid_mask], target_adj[valid_mask], reduction="mean")
+    else:
+        # return a zero that still participates in the graph
+        return expected.sum() * 0.0
 
 def knn_laplacian_loss(embeddings: torch.Tensor, 
                        times: torch.Tensor, 
