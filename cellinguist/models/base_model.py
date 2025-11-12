@@ -539,7 +539,7 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
             # Update the batch dictionary with the current expression tokens.
             mask_positions = get_dynamic_mask_positions(
                 current_expression_tokens,
-                pad_token_id=PAD_TOKEN_ID,
+                pad_token_id=pad_token_id,
                 reserved_tokens=3,
                 frac=0.15
             )
