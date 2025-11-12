@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from flash_attn.flash_attn_interface import flash_attn_func
-from .loss import compute_similarity_loss, mse_loss_for_expression, hurdle_nb_loss
+from .loss import compute_similarity_loss, mse_loss_for_expression, hurdle_nb_loss, ce_loss_for_expression
 import torch.nn.functional as F
 import math
 import torch.distributed as dist
@@ -529,7 +529,7 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
             if mask_positions.sum() == 0:
                 loss_masked = masked_logits.sum() * 0.0  # zero, but connected graph
             if mask_positions.sum() > 0:
-                loss_masked = mse_loss_for_expression(masked_logits, input_expression_tokens, ignore_index=[0,1,2])
+                loss_masked = ce_loss_for_expression(masked_logits, input_expression_tokens, ignore_indices=(0,1,2))
                 loss_gene_id = F.cross_entropy(gene_id_logits[mask_positions], input_gene_id_tokens[mask_positions],ignore_index=pad_token_id)
             else:
                 loss_masked = torch.tensor(0.0, device=device)
@@ -538,7 +538,7 @@ def train_epoch_ddp(dataloader, ddp_model, optimizer, device, mask_token_id: int
             # Compute a domain classification loss (e.g., cross-entropy) using the domain labels:
             loss_domain = F.cross_entropy(domain_preds, batch['domain'])
             # Combine losses
-            loss = 0.002*loss_masked + 2*loss_hurdle_mixed + 0*loss_similarity + 1.0*loss_domain + 1.0*loss_gene_id
+            loss = 1*loss_masked + 2*loss_hurdle_mixed + 10*loss_similarity + 1.0*loss_domain + 0.1*loss_gene_id
             loss.backward()
             optimizer.step()
             # total_norm = torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), 1.0)

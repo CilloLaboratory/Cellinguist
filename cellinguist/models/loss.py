@@ -93,6 +93,57 @@ def mse_loss_for_expression(
         # return a zero that still participates in the graph
         return expected.sum() * 0.0
 
+import torch
+import torch.nn.functional as F
+
+def ce_loss_for_expression(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    reserved_tokens: int = 3,          # e.g., [CLS]=0, [PAD]=1, [MASK]=2
+    ignore_indices = (0, 1, 2),        # positions to ignore in target
+) -> torch.Tensor:
+    """
+    Cross-entropy over expression bins only (excludes reserved tokens).
+    logits: [..., V]
+    target: [...] (same leading dims), int64 bin ids including reserved tokens
+    """
+    V = logits.size(-1)
+    E = V - reserved_tokens
+    assert target.dtype in (torch.int32, torch.int64), "target must be integer bins"
+
+    # 1) Slice away reserved tokens from logits
+    logits_expr = logits[..., reserved_tokens:]                 # [..., E]
+
+    # 2) Shift targets to the expression-bin index space [0..E-1]
+    target_adj = target - reserved_tokens                       # [...]
+
+    # 3) Build a boolean mask of positions to ignore
+    dev = target.device
+    if isinstance(ignore_indices, (list, tuple, set)):
+        ignore_tensor = torch.tensor(list(ignore_indices), device=dev, dtype=target.dtype)
+        ignore_mask = torch.isin(target, ignore_tensor)         # True where target is a reserved/ignored token
+    else:
+        # single int
+        ignore_mask = (target == ignore_indices)
+
+    # Also ignore anything outside [0, E-1] after shifting
+    invalid_range = (target_adj < 0) | (target_adj >= E)
+
+    # 4) Make a CE-friendly target, with ignored spots = -100
+    ce_target = target_adj.clone()
+    ce_target[ignore_mask | invalid_range] = -100               # CE ignore_index
+
+    # 5) Compute CE (flatten is fine)
+    loss = F.cross_entropy(
+        logits_expr.reshape(-1, E),
+        ce_target.reshape(-1),
+        ignore_index=-100,
+        reduction="mean",
+    )
+    return loss
+
+
 def knn_laplacian_loss(embeddings: torch.Tensor, 
                        times: torch.Tensor, 
                        k: int = 5) -> torch.Tensor:
