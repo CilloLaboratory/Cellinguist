@@ -1,47 +1,61 @@
 import torch
 from torch.utils.data import DataLoader
-from cellinguist.data.datasets import SingleCellDataset
+from cellinguist.data.datasets import SingleCellDataset, CBOWPairsDataset, CBOWPairsConfig
 from cellinguist.models.cbow import (
     CBOWModel,
     CBOWTrainer,
-    CBOWTrainerConfig,
-    build_cbow_training_pairs,
+    cbow_negative_sampling_loss
 )
+
+# /home/arc85/Desktop/Cellinguist/cytokine_dictionary_2k_pbs_ifng_251108.h5ad
+# /home/arc85/Desktop/Cellinguist/cytokine_dict_ser_sub_full_genes_ad_251118.h5ad
 
 # 1. Build SingleCellDataset
 ds = SingleCellDataset(
-    "/home/arc85/Desktop/Cellinguist/cytokine_dictionary_2k_pbs_ifng_251108.h5ad",
+    "/home/arc85/Desktop/Cellinguist/cytokine_dict_ser_sub_full_genes_ad_251118.h5ad",
     gene_key="gene",
     cond_key=None,     # or None
     n_bins=20,
     shuffle_tokens=True,
     min_expr=0.0,
 )
-token_id_seqs = ds._token_id_seqs  # or expose via a property
 
-# 2. Build CBOW triples
-target_ids, context_ids, negative_ids = build_cbow_training_pairs(
-    token_id_seqs=token_id_seqs,
-    vocab_size=ds.vocab_size,
+# 2. Wrap in CBOWPairsDataser
+pairs_cfg = CBOWPairsConfig(
     window_size=5,
     num_negatives=10,
+    samples_per_cell=2,   # e.g., 2 random windows per cell per "epoch"
+)
+cbow_pairs_ds = CBOWPairsDataset(ds, pairs_cfg)
+
+dl = DataLoader(
+    cbow_pairs_ds,
+    batch_size=512,
+    shuffle=False,   # dataset already randomizes; shuffle not essential
+    num_workers=0,
 )
 
-# 3. Wrap in a TensorDataset/DataLoader for training
-cbow_dataset = torch.utils.data.TensorDataset(target_ids, context_ids, negative_ids)
-cbow_loader = DataLoader(cbow_dataset, batch_size=1024, shuffle=True)
-
-# 4. Model + trainer
+# 3. Model + trainer
 model = CBOWModel(vocab_size=ds.vocab_size, emb_dim=128)
-config = CBOWTrainerConfig(lr=1e-3, epochs=5, device="cuda")
-trainer = CBOWTrainer(model, config)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
 
-for epoch in range(config.epochs):
-    loss = trainer.train_epoch(
-        {"target_ids": b[0], "context_ids": b[1], "negative_ids": b[2]}
-        for b in cbow_loader
-    )
-    print(f"Epoch {epoch}: loss={loss:.4f}")
+# 4. Tiny test epoch
+for batch in dl:
+    target_ids = batch["target_ids"].to(device)       # (B,)
+    context_ids = batch["context_ids"].to(device)     # (B, 2w)
+    negative_ids = batch["negative_ids"].to(device)   # (B, K)
+
+    pos_logits, neg_logits = model(target_ids, context_ids, negative_ids)
+    loss = cbow_negative_sampling_loss(pos_logits, neg_logits)
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    print("Batch loss:", float(loss.item()))
+    break  # just a sanity check
+
+## Stop here
 
 trainer.save_embeddings("/home/arc85/Desktop/Cellinguist/gene_token_embeddings_251121.pt")
 

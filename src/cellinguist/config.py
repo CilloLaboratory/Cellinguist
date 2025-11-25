@@ -65,6 +65,8 @@ class CBOWConfig:
     lr_step_size: int = 10
     lr_gamma: float = 0.5
 
+    samples_per_cell: int = 1
+
 
 # ---------------------------------------------------------------------------
 # Config loading

@@ -1,29 +1,33 @@
-# src/cellinguist_cbow/train/train_cbow.py
-
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 
-from cellinguist_cbow.config import CBOWConfig  # you'll define this
-from cellinguist_cbow.data.datasets import SingleCellDataset
-from cellinguist_cbow.models.cbow import (
+from cellinguist.config import CBOWConfig, load_config
+from cellinguist.data.datasets import (
+    SingleCellDataset,
+    CBOWPairsDataset,
+    CBOWPairsConfig,
+)
+from cellinguist.models.cbow import (
     CBOWModel,
     cbow_negative_sampling_loss,
-    build_cbow_training_pairs,
 )
-from cellinguist_cbow.embeddings import save_gene_embeddings
+from cellinguist.embeddings import save_gene_embeddings
 
+## Attempt for CPU training
+torch.set_num_threads(12)
 
 def train_cbow(
     config: CBOWConfig,
     dataset: SingleCellDataset,
 ) -> torch.Tensor:
     """
-    Train a CBOWModel on token sequences from a SingleCellDataset.
+    Train a CBOWModel on token sequences from a SingleCellDataset,
+    using CBOWPairsDataset to generate (target, context, negatives)
+    on the fly.
 
     Parameters
     ----------
@@ -41,37 +45,32 @@ def train_cbow(
     device = torch.device(config.device)
 
     # ------------------------------------------------------------------
-    # 1. Extract token sequences & vocab info from dataset
+    # 1. Wrap SingleCellDataset in CBOWPairsDataset
     # ------------------------------------------------------------------
-    # token_id_seqs: List[np.ndarray], one sequence per cell
-    token_id_seqs = dataset._token_id_seqs  # or expose via a property later
-    vocab_size = dataset.vocab_size
-
-    # ------------------------------------------------------------------
-    # 2. Build CBOW training triples (target, context, negatives)
-    # ------------------------------------------------------------------
-    target_ids, context_ids, negative_ids = build_cbow_training_pairs(
-        token_id_seqs=token_id_seqs,
-        vocab_size=vocab_size,
+    pairs_cfg = CBOWPairsConfig(
         window_size=config.window_size,
         num_negatives=config.num_negatives,
-        neg_sampling_dist=None,  # let function build unigram^0.75 dist
-        rng=None,                # let function create its own RNG
+        samples_per_cell=config.samples_per_cell,
+    )
+    cbow_pairs_ds = CBOWPairsDataset(
+        sc_dataset=dataset,
+        config=pairs_cfg,
+        neg_sampling_dist=None,  # let it build unigram^0.75
+        rng=None,                # let it create its own RNG
     )
 
-    # Wrap into a TensorDataset so DataLoader can batch it
-    cbow_dataset = TensorDataset(target_ids, context_ids, negative_ids)
-
     dataloader = DataLoader(
-        cbow_dataset,
+        cbow_pairs_ds,
         batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
+        shuffle=False,  # dataset is already stochastic; shuffle not essential
+        num_workers=11,  # adjust as needed
         pin_memory=(device.type == "cuda"),
     )
 
+    vocab_size = dataset.vocab_size
+
     # ------------------------------------------------------------------
-    # 3. Set up CBOWModel, optimizer, (optional) LR scheduler
+    # 2. Set up CBOWModel, optimizer, (optional) LR scheduler
     # ------------------------------------------------------------------
     model = CBOWModel(
         vocab_size=vocab_size,
@@ -97,7 +96,7 @@ def train_cbow(
         raise ValueError(f"Unsupported lr_scheduler: {config.lr_scheduler}")
 
     # ------------------------------------------------------------------
-    # 4. Training loop
+    # 3. Training loop
     # ------------------------------------------------------------------
     for epoch in range(config.epochs):
         model.train()
@@ -105,15 +104,15 @@ def train_cbow(
         total_batches = 0
 
         for batch in dataloader:
-            target_ids_b, context_ids_b, negative_ids_b = batch
-            target_ids_b = target_ids_b.to(device)
-            context_ids_b = context_ids_b.to(device)
-            negative_ids_b = negative_ids_b.to(device)
+            # batch keys: "target_ids", "context_ids", "negative_ids", "cell_idx", "position"
+            target_ids = batch["target_ids"].to(device)       # (B,)
+            context_ids = batch["context_ids"].to(device)     # (B, 2 * window_size)
+            negative_ids = batch["negative_ids"].to(device)   # (B, num_negatives)
 
             pos_logits, neg_logits = model(
-                target_ids=target_ids_b,
-                context_ids=context_ids_b,
-                negative_ids=negative_ids_b,
+                target_ids=target_ids,
+                context_ids=context_ids,
+                negative_ids=negative_ids,
             )
             loss = cbow_negative_sampling_loss(
                 pos_logits,
@@ -135,7 +134,7 @@ def train_cbow(
             scheduler.step()
 
     # ------------------------------------------------------------------
-    # 5. Return learned embeddings (input embeddings)
+    # 4. Return learned embeddings (input embeddings)
     # ------------------------------------------------------------------
     embeddings = model.input_emb.weight.detach().cpu()
     return embeddings
@@ -146,7 +145,7 @@ def run_cbow_training_from_config(config_path: str) -> None:
     High-level entry point:
       - Load CBOWConfig from a config file
       - Load data into SingleCellDataset
-      - Train CBOW model
+      - Train CBOW model with CBOWPairsDataset
       - Save embeddings to disk
 
     Parameters
@@ -154,13 +153,11 @@ def run_cbow_training_from_config(config_path: str) -> None:
     config_path : str
         Path to a config file (e.g. YAML/JSON) that specifies CBOWConfig and data params.
     """
-    from cellinguist_cbow.config import load_config  # you will define this
-
     # Load a dict-like config and build CBOWConfig
     raw_cfg = load_config(config_path)
     cbow_cfg = CBOWConfig(**raw_cfg["cbow"])
 
-    # Data-related settings (you can structure this however you like)
+    # Data-related settings
     data_cfg = raw_cfg["data"]
     adata_path = data_cfg["adata_path"]
     gene_key = data_cfg.get("gene_key", "gene")
@@ -171,7 +168,7 @@ def run_cbow_training_from_config(config_path: str) -> None:
     min_expr = data_cfg.get("min_expr", 0.0)
     min_token_count = data_cfg.get("min_token_count", 1)
 
-    # Build dataset
+    # Build SingleCellDataset (constructs vocab and token_id_seqs)
     dataset = SingleCellDataset(
         adata_or_path=adata_path,
         gene_key=gene_key,
@@ -193,3 +190,18 @@ def run_cbow_training_from_config(config_path: str) -> None:
     save_gene_embeddings(str(out_path), embeddings)
 
     print(f"[CBOW] Saved embeddings to: {out_path}")
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Train CBOW embeddings from config file.")
+    parser.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="Path to YAML/JSON config file."
+    )
+    args = parser.parse_args()
+    run_cbow_training_from_config(args.config)
+
+if __name__ == "__main__":
+    main()
