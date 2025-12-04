@@ -30,6 +30,8 @@ class CBOWConfig:
         Context window radius. Total context size = 2 * window_size.
     num_negatives : int
         Number of negative samples per (target, context) pair.
+    num_workers : int
+        Number of cpus for dataloader.
     batch_size : int
         Minibatch size for training.
     epochs : int
@@ -54,6 +56,7 @@ class CBOWConfig:
     emb_dim: int = 128
     window_size: int = 5
     num_negatives: int = 10
+    num_workers: int = 12
     batch_size: int = 1024
     epochs: int = 5
     lr: float = 1e-3
@@ -66,6 +69,35 @@ class CBOWConfig:
     lr_gamma: float = 0.5
 
     samples_per_cell: int = 1
+
+
+# ---------------------------------------------------------------------------
+# VAE Config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class VAEConfig:
+    n_genes: int                  # must match expression dim
+    latent_dim: int = 32
+    hidden_dim: int = 256
+    n_hidden_layers: int = 2
+
+    # conditioning
+    n_conditions: int | None = None
+    cond_emb_dim: int = 16
+
+    # losses
+    kl_weight: float = 1.0
+
+    # training
+    lr: float = 1e-3
+    weight_decay: float = 0.0
+    batch_size: int = 256
+    epochs: int = 50
+    device: str = "cuda"
+
+    # CBOW embeddings
+    freeze_gene_embeddings: bool = True
 
 
 # ---------------------------------------------------------------------------

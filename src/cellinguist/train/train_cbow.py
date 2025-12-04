@@ -10,15 +10,13 @@ from cellinguist.data.datasets import (
     SingleCellDataset,
     CBOWPairsDataset,
     CBOWPairsConfig,
+    build_neg_sampling_dist_from_dataset
 )
 from cellinguist.models.cbow import (
     CBOWModel,
     cbow_negative_sampling_loss,
 )
 from cellinguist.embeddings import save_gene_embeddings
-
-## Attempt for CPU training
-torch.set_num_threads(12)
 
 def train_cbow(
     config: CBOWConfig,
@@ -49,13 +47,11 @@ def train_cbow(
     # ------------------------------------------------------------------
     pairs_cfg = CBOWPairsConfig(
         window_size=config.window_size,
-        num_negatives=config.num_negatives,
         samples_per_cell=config.samples_per_cell,
     )
     cbow_pairs_ds = CBOWPairsDataset(
         sc_dataset=dataset,
         config=pairs_cfg,
-        neg_sampling_dist=None,  # let it build unigram^0.75
         rng=None,                # let it create its own RNG
     )
 
@@ -63,14 +59,21 @@ def train_cbow(
         cbow_pairs_ds,
         batch_size=config.batch_size,
         shuffle=False,  # dataset is already stochastic; shuffle not essential
-        num_workers=11,  # adjust as needed
+        num_workers=config.num_workers,  # adjust as needed
         pin_memory=(device.type == "cuda"),
+        persistent_workers=True
     )
 
     vocab_size = dataset.vocab_size
 
+    # 2. Build negative sampling distribution once, and move to device
+    neg_sampling_dist_np = build_neg_sampling_dist_from_dataset(dataset)
+    neg_sampling_dist = torch.from_numpy(neg_sampling_dist_np).to(
+        device=device, dtype=torch.float32
+    )
+
     # ------------------------------------------------------------------
-    # 2. Set up CBOWModel, optimizer, (optional) LR scheduler
+    # 3. Set up CBOWModel, optimizer, (optional) LR scheduler
     # ------------------------------------------------------------------
     model = CBOWModel(
         vocab_size=vocab_size,
@@ -104,10 +107,20 @@ def train_cbow(
         total_batches = 0
 
         for batch in dataloader:
-            # batch keys: "target_ids", "context_ids", "negative_ids", "cell_idx", "position"
-            target_ids = batch["target_ids"].to(device)       # (B,)
-            context_ids = batch["context_ids"].to(device)     # (B, 2 * window_size)
-            negative_ids = batch["negative_ids"].to(device)   # (B, num_negatives)
+            # batch keys: "target_ids", "context_ids", "cell_idx", "position"
+            target_ids = batch["target_ids"].to(device, non_blocking=True)       # (B,)
+            context_ids = batch["context_ids"].to(device, non_blocking=True)     # (B, 2 * window_size)
+            
+            B = target_ids.size(0)
+            K = config.num_negatives
+
+            # Sample negatives with torch.multinomial on the device
+            # neg_sampling_dist is (vocab_size,)
+            negative_ids = torch.multinomial(
+                neg_sampling_dist,
+                num_samples=B * K,
+                replacement=True,
+            ).view(B, K)   # (B, K
 
             pos_logits, neg_logits = model(
                 target_ids=target_ids,

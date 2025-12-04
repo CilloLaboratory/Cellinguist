@@ -7,6 +7,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+import anndata as ad
+
 try:
     import anndata as ad
 except ImportError as e:
@@ -405,8 +407,6 @@ class CBOWPairsConfig:
     ----------
     window_size : int
         Context window radius. Total context length = 2 * window_size.
-    num_negatives : int
-        Number of negative samples per target.
     samples_per_cell : int
         Logical number of CBOW samples per cell per "epoch". The dataset
         length will be n_cells * samples_per_cell, and each __getitem__
@@ -414,92 +414,44 @@ class CBOWPairsConfig:
     """
 
     window_size: int = 5
-    num_negatives: int = 10
     samples_per_cell: int = 1
 
 class CBOWPairsDataset(Dataset):
     """
-    Dataset that wraps SingleCellDataset and yields CBOW training triples:
-      - target_ids:   LongTensor of shape (1,)
-      - context_ids:  LongTensor of shape (2 * window_size,)
-      - negative_ids: LongTensor of shape (num_negatives,)
+    Dataset that wraps SingleCellDataset and yields CBOW training pairs:
+        - target_ids:  LongTensor[1]
+        - context_ids: LongTensor[2 * window_size]
 
-    Each __getitem__:
-      - Picks a cell (based on index and samples_per_cell)
-      - Randomly selects a valid target position with a full context window
-      - Constructs the context window
-      - Samples negative tokens from a precomputed negative-sampling distribution
+    Negative samples are NOT generated here anymore; they are sampled in the
+    training loop using torch.multinomial on the device.
     """
 
     def __init__(
         self,
         sc_dataset: SingleCellDataset,
         config: CBOWPairsConfig,
-        neg_sampling_dist: Optional[np.ndarray] = None,
         rng: Optional[np.random.Generator] = None,
     ) -> None:
-        """
-        Parameters
-        ----------
-        sc_dataset : SingleCellDataset
-            Underlying single-cell dataset with token_id sequences.
-        config : CBOWPairsConfig
-            Configuration for window size, negatives, and samples_per_cell.
-        neg_sampling_dist : Optional[np.ndarray], default None
-            1D array of shape (vocab_size,) with probabilities used for
-            negative sampling. If None, a unigram^0.75 distribution is
-            estimated from sc_dataset._token_id_seqs.
-        rng : Optional[np.random.Generator], default None
-            NumPy RNG for sampling target positions and negatives. If None,
-            a new default_rng() is created.
-        """
         super().__init__()
         self.sc_dataset = sc_dataset
         self.window_size = int(config.window_size)
-        self.num_negatives = int(config.num_negatives)
         self.samples_per_cell = int(config.samples_per_cell)
         self.rng = rng if rng is not None else np.random.default_rng()
 
-        self.vocab_size = sc_dataset.vocab_size
-        self.token_id_seqs = sc_dataset._token_id_seqs  # List[np.ndarray]
+        # Convert token_id_seqs to torch.LongTensor once up front
+        self.token_id_seqs = [
+            torch.from_numpy(seq.astype(np.int64)) for seq in sc_dataset._token_id_seqs
+        ]
         self.n_cells = len(self.token_id_seqs)
+        self.vocab_size = sc_dataset.vocab_size
 
-        # Build negative sampling distribution if not provided
-        if neg_sampling_dist is None:
-            self.neg_sampling_dist = self._build_neg_sampling_dist()
-        else:
-            if neg_sampling_dist.shape[0] != self.vocab_size:
-                raise ValueError(
-                    f"neg_sampling_dist length {neg_sampling_dist.shape[0]} "
-                    f"does not match vocab_size {self.vocab_size}"
-                )
-            self.neg_sampling_dist = neg_sampling_dist
-
-        # Precompute which cells have at least one valid CBOW position
+        # Precompute which cells have at least one valid CBOW window
         self._valid_cells = self._find_valid_cells()
-        if len(self._valid_cells) == 0:
+        if self._valid_cells.size == 0:
             raise ValueError(
                 "No cells have enough tokens for the chosen window_size. "
                 "Reduce window_size or check tokenization."
             )
-
-    def _build_neg_sampling_dist(self) -> np.ndarray:
-        """
-        Build a unigram^0.75 negative sampling distribution from token_id_seqs.
-        """
-        counts = np.zeros(self.vocab_size, dtype=np.float64)
-        for seq in self.token_id_seqs:
-            if seq.size == 0:
-                continue
-            local_counts = np.bincount(seq, minlength=self.vocab_size).astype(
-                np.float64
-            )
-            counts += local_counts
-
-        counts[counts <= 0] = 1e-8
-        dist = counts ** 0.75
-        dist /= dist.sum()
-        return dist
 
     def _find_valid_cells(self) -> np.ndarray:
         """
@@ -507,93 +459,168 @@ class CBOWPairsDataset(Dataset):
         with a full context window on both sides.
         """
         valid = []
-        min_len = 2 * self.window_size + 1
+        w = self.window_size
+        min_len = 2 * w + 1
         for i, seq in enumerate(self.token_id_seqs):
-            if seq.size >= min_len:
+            if seq.numel() >= min_len:
                 valid.append(i)
         return np.asarray(valid, dtype=np.int64)
 
     def __len__(self) -> int:
         """
-        The logical length is n_cells * samples_per_cell.
+        Logical dataset length is n_cells * samples_per_cell.
 
-        Each __getitem__ will sample one CBOW window from some cell;
-        this does NOT enumerate all possible windows in the corpus,
-        but provides a stochastic approximation that scales well.
+        Each __getitem__ draws one random CBOW window from a (random) valid cell.
         """
         return self.n_cells * self.samples_per_cell
 
-    def _sample_cell_and_position(self) -> (int, int):
+    def _sample_cell_and_position(self) -> tuple[int, int]:
         """
         Sample a valid cell and a valid target position within that cell.
         """
-        min_len = 2 * self.window_size + 1
+        w = self.window_size
+        min_len = 2 * w + 1
 
-        # Try a few times to find a valid cell; fall back if pathological
+        # Sample a valid cell index uniformly
         for _ in range(10):
             cell_idx = int(self.rng.choice(self._valid_cells))
             seq = self.token_id_seqs[cell_idx]
-            L = seq.size
+            L = seq.numel()
             if L >= min_len:
-                # valid target positions: [window_size, L - window_size - 1]
-                pos = self.rng.integers(self.window_size, L - self.window_size)
-                return cell_idx, int(pos)
+                pos = int(self.rng.integers(w, L - w))
+                return cell_idx, pos
 
-        # If we somehow fail repeatedly, just pick the first valid cell deterministically
+        # Fallback: first valid cell, deterministic safe position
         cell_idx = int(self._valid_cells[0])
         seq = self.token_id_seqs[cell_idx]
-        L = seq.size
-        pos = max(self.window_size, min(L - self.window_size - 1, self.window_size))
-        return cell_idx, int(pos)
+        L = seq.numel()
+        w = self.window_size
+        pos = max(w, min(L - w - 1, w))
+        return cell_idx, pos
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """
-        Return a single CBOW training triple as a dict:
+        Return a single CBOW training pair as a dict:
 
             {
-                "target_ids":   LongTensor[1],
-                "context_ids":  LongTensor[2 * window_size],
-                "negative_ids": LongTensor[num_negatives],
-                "cell_idx":     int,
-                "position":     int,
+                "target_ids":  LongTensor[1],
+                "context_ids": LongTensor[2 * window_size],
+                "cell_idx":    int,
+                "position":    int,
             }
 
         When batched by DataLoader, you'll get:
-            - target_ids:   (B,)
-            - context_ids:  (B, 2 * window_size)
-            - negative_ids: (B, num_negatives)
+            - target_ids:  (B,)
+            - context_ids: (B, 2 * window_size)
         """
-        # Optionally, map idx -> cell_idx deterministically:
-        # cell_idx = idx // self.samples_per_cell
-        # but we then must ensure that cell_idx has enough tokens.
-        # Here we just sample randomly among valid cells for robustness.
         cell_idx, pos = self._sample_cell_and_position()
         seq = self.token_id_seqs[cell_idx]
-        L = seq.size
-
         w = self.window_size
-        target = int(seq[pos])
 
-        left_context = seq[pos - w : pos]
-        right_context = seq[pos + 1 : pos + 1 + w]
-        assert left_context.size == w, f"Left context size mismatch for cell {cell_idx}"
-        assert right_context.size == w, f"Right context size mismatch for cell {cell_idx}"
+        target = seq[pos]                            # scalar LongTensor
+        left_context = seq[pos - w : pos]           # (w,)
+        right_context = seq[pos + 1 : pos + 1 + w]  # (w,)
 
-        context = np.concatenate([left_context, right_context], axis=0)  # (2w,)
+        # All torch ops, no numpy
+        context = torch.cat([left_context, right_context], dim=0)  # (2w,)
 
-        # Sample negatives (independent of target/context)
-        neg_ids = self.rng.choice(
-            self.vocab_size,
-            size=self.num_negatives,
-            replace=True,
-            p=self.neg_sampling_dist,
-        )
-
-        sample: Dict[str, Any] = {
-            "target_ids": torch.tensor(target, dtype=torch.long),
-            "context_ids": torch.from_numpy(context.astype(np.int64)),
-            "negative_ids": torch.from_numpy(neg_ids.astype(np.int64)),
+        return {
+            "target_ids": target,          # LongTensor[]
+            "context_ids": context,        # LongTensor[2w]
             "cell_idx": cell_idx,
             "position": pos,
         }
-        return sample    
+    
+def build_neg_sampling_dist_from_dataset(dataset: SingleCellDataset) -> np.ndarray:
+    """
+    Build a unigram^0.75 negative sampling distribution from dataset token_id_seqs.
+    Returns a 1D numpy array of shape (vocab_size,).
+    """
+    vocab_size = dataset.vocab_size
+    counts = np.zeros(vocab_size, dtype=np.float64)
+    for seq in dataset._token_id_seqs:
+        if seq.size == 0:
+            continue
+        local_counts = np.bincount(seq, minlength=vocab_size).astype(np.float64)
+        counts += local_counts
+
+    counts[counts <= 0] = 1e-8
+    dist = counts ** 0.75
+    dist /= dist.sum()
+    return dist
+
+
+class SingleCellVAEDataset(Dataset):
+    """
+    Simple dataset for VAE training.
+
+    Returns:
+      - x_expr: (G,) tensor of expression (e.g., log1p normalized counts)
+      - cond_idx: Optional scalar LongTensor (if cond_key is given)
+    """
+
+    def __init__(
+        self,
+        adata_or_path,
+        gene_key: str = "gene",
+        layer: Optional[str] = None,
+        cond_key: Optional[str] = None,
+        gene_order: Optional[list[str]] = None,
+        transform: str = "log1p",
+    ) -> None:
+        super().__init__()
+        if isinstance(adata_or_path, ad.AnnData):
+            adata = adata_or_path
+        else:
+            adata = ad.read_h5ad(adata_or_path)
+        self.adata = adata
+
+        # Choose expression matrix
+        if layer is None:
+            X = adata.X
+        else:
+            X = adata.layers[layer]
+
+        X = X.astype(np.float32)
+        if transform == "log1p":
+            X = np.log1p(X)
+        elif transform == "none":
+            pass
+        else:
+            raise ValueError(f"Unsupported transform: {transform}")
+
+        # Ensure dense
+        if not isinstance(X, np.ndarray):
+            X = X.toarray().astype(np.float32)
+        self.X = X  # (N, G)
+
+        # Optionally reorder genes to match a target order (e.g. CBOW vocab order)
+        if gene_order is not None:
+            # adata.var[gene_key] should list genes
+            var_genes = self.adata.var[gene_key].astype(str).to_list()
+            idx_map = {g: i for i, g in enumerate(var_genes)}
+            indices = [idx_map[g] for g in gene_order]
+            self.X = self.X[:, indices]
+            self.gene_order = gene_order
+        else:
+            self.gene_order = self.adata.var[gene_key].astype(str).to_list()
+
+        # Condition
+        if cond_key is not None:
+            cond_series = self.adata.obs[cond_key].astype("category")
+            self.cond_categories = list(cond_series.cat.categories)
+            self.cond_idx = cond_series.cat.codes.to_numpy().astype(np.int64)
+        else:
+            self.cond_categories = None
+            self.cond_idx = None
+
+    def __len__(self) -> int:
+        return self.X.shape[0]
+
+    def __getitem__(self, idx: int):
+        x = torch.from_numpy(self.X[idx])  # (G,)
+        if self.cond_idx is not None:
+            c = torch.tensor(self.cond_idx[idx], dtype=torch.long)
+            return {"x_expr": x, "cond_idx": c}
+        else:
+            return {"x_expr": x}
