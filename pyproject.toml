@@ -43,3 +43,5 @@ include = ["cellinguist_cbow*"]
 train-cbow = "cellinguist.train.train_cbow:main"
 export-gene-embeddings = "cellinguist.scripts.export_gene_embeddings:main"
 export-cell-embeddings = "cellinguist.scripts.export_cell_embeddings:main"
+train-vae = "cellinguist.train.train_vae:main"
+export-vae-predictions = "cellinguist.scripts.export_vae_predictions:main"

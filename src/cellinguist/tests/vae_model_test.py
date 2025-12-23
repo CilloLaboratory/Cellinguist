@@ -10,9 +10,9 @@ from cellinguist.data.datasets import SingleCellVAEDataset
 from cellinguist.embeddings import load_gene_embeddings
 from cellinguist.models.vae import (
     CBOWCellEncoder,
-    ExpressionDecoder,
+    ZINBExpressionDecoder,
     GeneVAE,
-    gaussian_reconstruction_loss,
+    zinb_negative_log_likelihood,
     kl_divergence_normal,
 )
 
@@ -31,11 +31,11 @@ adata_path = "/home/arc85/Desktop/Cellinguist/cytokine_dict_ser_sub_full_genes_a
 gene_key = "gene" 
 adata = ad.read_h5ad(adata_path)
 dataset_full = SingleCellVAEDataset(
-    adata_or_path=adata[0:10000,:],
+    adata_or_path=adata[0:1000,:],
     gene_key=gene_key,
     layer=None,
     cond_key=None,       # or e.g. "condition"
-    transform="log1p",
+    transform="none",
 )
 genes_expr = dataset_full.gene_order
 
@@ -66,7 +66,7 @@ vae_dataset = SingleCellVAEDataset(
     layer=None,
     cond_key=None,            # or some condition column
     gene_order=genes_common,  # <--- align expression to embeddings
-    transform="log1p",
+    transform="none", # <--- none for ZINB model, log-transform inside encoder
 )
 
 n_cells, n_genes = vae_dataset.X.shape
@@ -99,9 +99,10 @@ encoder = CBOWCellEncoder(
     n_conditions=cfg.n_conditions,
     cond_emb_dim=cfg.cond_emb_dim,
     freeze_gene_embeddings=True,
+    input_transform="log1p"
 )
 
-decoder = ExpressionDecoder(
+decoder = ZINBExpressionDecoder(
     n_genes=n_genes,
     latent_dim=cfg.latent_dim,
     hidden_dim=cfg.hidden_dim,
@@ -133,15 +134,30 @@ for epoch in range(cfg.epochs):
     total_batches = 0
 
     for batch in dataloader:
+        # x_expr is raw counts now
         x_expr = batch["x_expr"].to(device, non_blocking=True)  # (B, G)
         cond_idx = batch.get("cond_idx", None)
         if cond_idx is not None:
             cond_idx = cond_idx.to(device, non_blocking=True)
 
-        recon_x, mu, logvar = model(x_expr, cond_idx)
+        # Encode
+        mu_z, logvar_z = model.encode(x_expr, cond_idx)
+        # Reparameterize
+        z = GeneVAE.reparameterize(mu_z, logvar_z)
+        # Decode to ZINB params
+        mu, theta, pi = decoder(z, cond_idx)
 
-        recon_loss = gaussian_reconstruction_loss(recon_x, x_expr, reduction="mean")
-        kl = kl_divergence_normal(mu, logvar, reduction="mean")
+        # Reconstruction loss in count space
+        recon_loss = zinb_negative_log_likelihood(
+            x_expr,
+            mu,
+            theta,
+            pi,
+            reduction="mean",
+        )
+
+        kl = kl_divergence_normal(mu_z, logvar_z, reduction="mean")
+
         loss = recon_loss + cfg.kl_weight * kl
 
         optimizer.zero_grad()
@@ -152,7 +168,7 @@ for epoch in range(cfg.epochs):
         total_batches += 1
 
     avg_loss = total_loss / max(total_batches, 1)
-    print(f"[VAE] Epoch {epoch+1}/{cfg.epochs} - loss: {avg_loss:.4f}")
+    print(f"[VAE-ZINB] Epoch {epoch+1}/{cfg.epochs} - loss: {avg_loss:.4f}")
 
 # 7. Extract predicted versus actual counts
 model.eval()
@@ -172,20 +188,16 @@ with torch.no_grad():
             cond_idx = cond_idx.unsqueeze(0).to(device)
 
         # Using mu directly for deterministic z
-        mu, logvar = model.encode(x_expr, cond_idx)
-        recon_x = model.decode(mu, cond_idx)  # (1, G)
+        mu_z, logvar_z = model.encode(x_expr, cond_idx)
+        recon_mu, recon_theta, recon_pi = decoder(mu_z, cond_idx)  # use mu_z (no sampling)
 
-        # Invert log1p to get counts
-        true_counts = torch.expm1(x_expr)       # (1, G)
-        pred_counts = torch.expm1(recon_x)      # (1, G)
-
-        # Clip negatives (can happen due to Gaussian decoder)
-        true_counts = torch.clamp(true_counts, min=0.0)
-        pred_counts = torch.clamp(pred_counts, min=0.0)
+        # recon_mu is your "predicted mean count" per gene
+        pred_counts = recon_mu.cpu().numpy()
+        true_counts = x_expr.cpu().numpy()
 
         # To CPU numpy
-        all_true_counts.append(true_counts.squeeze(0).cpu().numpy())
-        all_pred_counts.append(pred_counts.squeeze(0).cpu().numpy())
+        all_true_counts.append(true_counts.squeeze(0))
+        all_pred_counts.append(pred_counts.squeeze(0))
 
         # Optionally track a cell ID (barcode or obs_names)
         cell_id = vae_dataset.adata.obs_names[idx]
@@ -200,8 +212,8 @@ genes = vae_dataset.gene_order  # genes_common, aligned with both arrays
 all_true_counts = pd.DataFrame(all_true_counts, index=all_cell_ids, columns=genes)
 all_pred_counts = pd.DataFrame(all_pred_counts, index=all_cell_ids, columns=genes)
 
-out_path_true = "/home/arc85/Desktop/cellinguist_results_251125/01_cytokine_testing_251125/03_output/cytokines_test_true_counts_1000_cells_251203.tsv.gz"
-out_path_pred = "/home/arc85/Desktop/cellinguist_results_251125/01_cytokine_testing_251125/03_output/cytokines_test_pred_counts_1000_cells_251203.tsv.gz"
+out_path_true = "/home/arc85/Desktop/cellinguist_results_251125/01_cytokine_testing_251125/03_output/cytokines_test_true_counts_1000_cells_251204.tsv.gz"
+out_path_pred = "/home/arc85/Desktop/cellinguist_results_251125/01_cytokine_testing_251125/03_output/cytokines_test_pred_counts_1000_cells_251204.tsv.gz"
 
 with gzip.open(out_path_true, "wt") as f:
     all_true_counts.to_csv(f, sep="\t", index=False)

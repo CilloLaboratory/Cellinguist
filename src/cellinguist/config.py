@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Optional, Any, Dict
 
 import json
 
@@ -76,29 +76,63 @@ class CBOWConfig:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class VAEConfig:
-    n_genes: int                  # must match expression dim
+class VAETrainConfig:
+    adata_path: str
+    gene_key: str = "gene"
+    layer: Optional[str] = None
+    cond_key: Optional[str] = None
+
+    gene_emb_tsv: str = ""
+
     latent_dim: int = 32
     hidden_dim: int = 256
     n_hidden_layers: int = 2
-
-    # conditioning
-    n_conditions: int | None = None
     cond_emb_dim: int = 16
+    input_transform: str = "log1p"
+    freeze_gene_embeddings: bool = True
 
-    # losses
     kl_weight: float = 1.0
 
-    # training
-    lr: float = 1e-3
+    lr: float = 3e-4
     weight_decay: float = 0.0
     batch_size: int = 256
     epochs: int = 50
+    num_workers: int = 4
+    device: str = "cuda"
+    grad_clip_norm: float = 1.0
+    seed: Optional[int] = 0
+
+    checkpoint_dir: str = "checkpoints"
+    run_name: str = "vae_run"
+    resume_from: Optional[str] = None
+    save_every: int = 1
+
+@dataclass
+class VAEExportConfig:
+    adata_path: str
+    gene_key: str = "gene"
+    layer: Optional[str] = None
+    cond_key: Optional[str] = None
+
+    gene_emb_tsv: str = ""
+    checkpoint_path: str = ""
+    out_pred_tsv_gz: str = "pred_mu.tsv.gz"
+
+    max_cells: int = 1000
+    batch_size: int = 64
+    num_workers: int = 4
     device: str = "cuda"
 
-    # CBOW embeddings
-    freeze_gene_embeddings: bool = True
 
+def load_yaml(path: str) -> Dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(path)
+    with p.open("r") as f:
+        cfg = yaml.safe_load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError("Config must be a YAML mapping.")
+    return cfg
 
 # ---------------------------------------------------------------------------
 # Config loading

@@ -62,6 +62,7 @@ class CBOWCellEncoder(nn.Module):
         n_conditions: Optional[int] = None,
         cond_emb_dim: int = 16,
         freeze_gene_embeddings: bool = True,
+        input_transform: str = "log1p",   # "log1p" or "none"
     ) -> None:
         super().__init__()
 
@@ -105,46 +106,62 @@ class CBOWCellEncoder(nn.Module):
             n_hidden_layers=n_hidden_layers,
         )
 
-    def forward(
-        self,
-        x_expr: torch.Tensor,
-        cond_idx: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Parameters
-        ----------
-        x_expr : (B, G) tensor
-            Expression matrix (already on device, same order of genes
-            as gene_embeddings). Typically log-normalized.
-        cond_idx : Optional[(B,) LongTensor]
-            Optional condition indices per cell.
+        self.input_transform = input_transform
 
-        Returns
-        -------
-        mu : (B, latent_dim)
-        logvar : (B, latent_dim)
-        """
+    def forward(self, x_expr, cond_idx=None):
         B, G = x_expr.shape
-        assert G == self.n_genes, (
-            f"Input has {G} genes, but encoder expects {self.n_genes}"
-        )
+        assert G == self.n_genes
 
-        # Expression-weighted CBOW: X @ E
-        # E: (G, d_gene)
+        # 1) Check raw input
+        if torch.isnan(x_expr).any() or torch.isinf(x_expr).any():
+            print("NaNs/Infs in x_expr!")
+
+        # 2) Apply transform for encoder
+        if self.input_transform == "log1p":
+            x_enc = torch.log1p(x_expr)
+        elif self.input_transform == "none":
+            x_enc = x_expr
+        else:
+            raise ValueError(f"Unsupported input_transform: {self.input_transform}")
+
+        if torch.isnan(x_enc).any() or torch.isinf(x_enc).any():
+            print("NaNs/Infs after log1p in x_enc")
+
+        # 3) Expression-weighted CBOW
         E = self.gene_embedding.weight  # (G, d_gene)
-        h_cell = x_expr @ E             # (B, d_gene)
+        if torch.isnan(E).any() or torch.isinf(E).any():
+            print("NaNs/Infs in gene_embeddings!")
 
-        # Optional condition embedding
+        h_cell = x_enc @ E  # (B, d_gene)
+
+        if torch.isnan(h_cell).any() or torch.isinf(h_cell).any():
+            print("NaNs/Infs after matmul (h_cell)")
+
+        # 4) Optional condition embedding
         if self.cond_embedding is not None and cond_idx is not None:
-            c = self.cond_embedding(cond_idx)  # (B, cond_emb_dim)
+            c = self.cond_embedding(cond_idx)
             h_in = torch.cat([h_cell, c], dim=-1)
         else:
             h_in = h_cell
 
+        if torch.isnan(h_in).any() or torch.isinf(h_in).any():
+            print("NaNs/Infs in h_in BEFORE MLP")
+
+        # 5) Check MLP parameters
+        for name, p in self.mlp_mu.named_parameters():
+            if torch.isnan(p).any() or torch.isinf(p).any():
+                print("NaNs/Infs in mlp_mu parameter:", name)
+        for name, p in self.mlp_logvar.named_parameters():
+            if torch.isnan(p).any() or torch.isinf(p).any():
+                print("NaNs/Infs in mlp_logvar parameter:", name)
+
         mu = self.mlp_mu(h_in)
         logvar = self.mlp_logvar(h_in)
-        return mu, logvar
 
+        if torch.isnan(mu).any() or torch.isnan(logvar).any():
+            print("NaNs in mu/logvar AFTER MLP")
+
+        return mu, logvar
 
 # ---------------------------------------------------------------------------
 # ExpressionDecoder: z (+ cond) -> reconstructed expression
@@ -278,6 +295,99 @@ class GeneVAE(nn.Module):
         recon_x = self.decode(z, cond_idx)
         return recon_x, mu, logvar
 
+# ---------------------------------------------------------------------------
+# ZINB decoder
+# ---------------------------------------------------------------------------
+
+class ZINBExpressionDecoder(nn.Module):
+    """
+    ZINB decoder: given z (+ optional cond), outputs
+      - mu    : mean counts per gene, shape (B, G), > 0
+      - theta : inverse dispersion per gene, shape (B, G) or (1, G), > 0
+      - pi    : dropout probability per gene, shape (B, G), in (0, 1)
+
+    For simplicity, we:
+      - predict mu and pi via MLP,
+      - keep theta as a gene-wise parameter (broadcast across batch).
+    """
+
+    def __init__(
+        self,
+        n_genes: int,
+        latent_dim: int,
+        hidden_dim: int,
+        n_hidden_layers: int,
+        n_conditions: Optional[int] = None,
+        cond_emb_dim: int = 16,
+    ) -> None:
+        super().__init__()
+        self.n_genes = n_genes
+
+        # Optional condition embedding
+        if n_conditions is not None:
+            self.cond_embedding = nn.Embedding(n_conditions, cond_emb_dim)
+            cond_input_dim = cond_emb_dim
+        else:
+            self.cond_embedding = None
+            cond_input_dim = 0
+
+        decoder_input_dim = latent_dim + cond_input_dim
+
+        # MLP for mu (pre-activation)
+        self.mlp_mu = MLP(
+            input_dim=decoder_input_dim,
+            output_dim=n_genes,
+            hidden_dim=hidden_dim,
+            n_hidden_layers=n_hidden_layers,
+        )
+
+        # MLP for pi (dropout logit)
+        self.mlp_pi = MLP(
+            input_dim=decoder_input_dim,
+            output_dim=n_genes,
+            hidden_dim=hidden_dim,
+            n_hidden_layers=n_hidden_layers,
+        )
+
+        # Gene-wise inverse dispersion parameter (learned)
+        # We'll apply softplus to ensure positivity.
+        self.log_theta = nn.Parameter(torch.zeros(n_genes))
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        cond_idx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        z : (B, latent_dim)
+        cond_idx : Optional[(B,) LongTensor]
+
+        Returns
+        -------
+        mu : (B, G)  > 0
+        theta : (B, G)  > 0
+        pi : (B, G)  in (0, 1)
+        """
+        if self.cond_embedding is not None and cond_idx is not None:
+            c = self.cond_embedding(cond_idx)
+            h_in = torch.cat([z, c], dim=-1)
+        else:
+            h_in = z
+
+        mu_logit = self.mlp_mu(h_in)   # (B, G)
+        pi_logit = self.mlp_pi(h_in)   # (B, G)
+
+        # Ensure positivity
+        mu = F.softplus(mu_logit) + 1e-8          # mean counts
+        theta = F.softplus(self.log_theta) + 1e-8  # (G,)
+        theta = theta.unsqueeze(0).expand_as(mu)   # (B, G)
+
+        # Dropout probability
+        pi = torch.sigmoid(pi_logit)              # (B, G)
+
+        return mu, theta, pi
 
 # ---------------------------------------------------------------------------
 # Loss helpers
@@ -326,5 +436,70 @@ def gaussian_reconstruction_loss(
         return mse.sum()
     elif reduction == "none":
         return mse
+    else:
+        raise ValueError(f"Unsupported reduction: {reduction}")
+
+def zinb_negative_log_likelihood(
+    x: torch.Tensor,
+    mu: torch.Tensor,
+    theta: torch.Tensor,
+    pi: torch.Tensor,
+    eps: float = 1e-8,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """
+    ZINB negative log-likelihood per cell:
+
+    x    : observed counts,   (B, G)
+    mu   : mean parameter,    (B, G)
+    theta: inv. dispersion,   (B, G)
+    pi   : dropout prob,      (B, G)
+    """
+    # x, mu, theta, pi must be non-negative / bounded appropriately
+    # Ensure numerical stability
+    mu = mu.clamp(min=eps)
+    theta = theta.clamp(min=eps)
+    pi = pi.clamp(min=eps, max=1 - eps)
+    x = x.clamp(min=0.0)
+
+    # log NB pmf
+    # lgamma(theta + x) - lgamma(theta) - lgamma(x + 1)
+    t1 = torch.lgamma(theta + x) - torch.lgamma(theta) - torch.lgamma(x + 1.0)
+
+    log_theta = torch.log(theta + eps)
+    log_mu = torch.log(mu + eps)
+    log_theta_mu = torch.log(theta + mu + eps)
+
+    t2 = theta * (log_theta - log_theta_mu)
+    t3 = x * (log_mu - log_theta_mu)
+    log_nb = t1 + t2 + t3            # log NB(x | mu, theta)
+
+    # NB probability of zero
+    # when x = 0, NB(0) = (theta / (theta + mu))^theta
+    log_nb_zero = theta * (log_theta - log_theta_mu)
+
+    # Mix with zero-inflation
+    # For x == 0:
+    #   log p(x=0) = log( pi + (1 - pi) * exp(log_nb_zero) )
+    # For x > 0:
+    #   log p(x)   = log(1 - pi) + log_nb
+    is_zero = (x < eps)
+
+    log_prob_zero = torch.log(
+        pi + (1.0 - pi) * torch.exp(log_nb_zero) + eps
+    )
+
+    log_prob_nonzero = torch.log(1.0 - pi + eps) + log_nb
+
+    log_prob = torch.where(is_zero, log_prob_zero, log_prob_nonzero)
+
+    nll = -log_prob.sum(dim=-1)  # sum over genes -> (B,)
+
+    if reduction == "mean":
+        return nll.mean()
+    elif reduction == "sum":
+        return nll.sum()
+    elif reduction == "none":
+        return nll
     else:
         raise ValueError(f"Unsupported reduction: {reduction}")
