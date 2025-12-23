@@ -23,7 +23,7 @@ batch_size: 256
 epochs: 50
 num_workers: 4
 device: "cuda"
-grad_clip_norm: 1.0
+grad_clip_norm: null
 seed: 0
 
 # checkpoints

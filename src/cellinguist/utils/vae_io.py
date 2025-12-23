@@ -24,6 +24,8 @@ def load_gene_embeddings_tsv(gene_emb_tsv: str) -> Tuple[List[str], torch.Tensor
     df = pd.read_csv(gene_emb_tsv, sep="\t")
     genes = df["gene"].astype(str).tolist()
     mat = df.drop(columns=["gene"]).to_numpy().astype("float32")
+    n_genes, d_mat = mat.shape
+    print(f"Loaded gene embeddings for {n_genes} genes and {d_mat} dimensions")
     return genes, torch.from_numpy(mat)
 
 
@@ -35,6 +37,7 @@ def intersect_genes_in_embedding_order(
     genes_common = [g for g in genes_from_emb if g in expr_set]
     if len(genes_common) == 0:
         raise ValueError("No overlapping genes between embeddings and expression data.")
+    print(f"Using {len(genes_common)} genes in common between embeddings and expression")
     return genes_common
 
 

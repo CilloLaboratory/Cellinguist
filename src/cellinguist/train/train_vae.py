@@ -45,6 +45,8 @@ def train_vae(cfg: VAETrainConfig) -> str:
     )
     genes_expr = ds_probe.gene_order
 
+    print(f"Expression dataset: {len(genes_expr)} genes before intersection")
+
     # --- Align genes in embedding order
     genes_common = intersect_genes_in_embedding_order(genes_from_emb, genes_expr)
     emb = subset_embeddings(genes_from_emb, emb_full, genes_common)
@@ -59,6 +61,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
         transform="none",
     )
     n_cells, n_genes = vae_dataset.X.shape
+    print(f"VAE dataset after alignment: {n_cells} cells, {n_genes} genes")
     assert n_genes == emb.shape[0]
 
     n_conditions = (
@@ -132,7 +135,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
             mu_z, logvar_z = model.encode(x, cond_idx)
             z = GeneVAE.reparameterize(mu_z, logvar_z)
 
-            mu, theta, pi = model.decoder(z, cond_idx)
+            mu, theta, pi = decoder(z, cond_idx)
 
             recon = zinb_negative_log_likelihood(x, mu, theta, pi, reduction="mean")
             kl = kl_divergence_normal(mu_z, logvar_z, reduction="mean")
@@ -181,7 +184,12 @@ def run_vae_training_from_config(config_path: str) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("config", type=str)
+    ap = argparse.ArgumentParser(description="Traine VAE from config file.")
+    ap.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="Path to YAML/JSON config file."
+    )
     args = ap.parse_args()
     run_vae_training_from_config(args.config)
