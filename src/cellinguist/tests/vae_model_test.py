@@ -5,7 +5,6 @@ import anndata as ad
 import numpy as np
 import gzip
 
-from cellinguist.config import VAEConfig
 from cellinguist.data.datasets import SingleCellVAEDataset
 from cellinguist.embeddings import load_gene_embeddings
 from cellinguist.models.vae import (
@@ -31,7 +30,7 @@ adata_path = "/home/arc85/Desktop/Cellinguist/cytokine_dict_ser_sub_full_genes_a
 gene_key = "gene" 
 adata = ad.read_h5ad(adata_path)
 dataset_full = SingleCellVAEDataset(
-    adata_or_path=adata[0:1000,:],
+    adata_or_path=adata[0:10000,:],
     gene_key=gene_key,
     layer=None,
     cond_key=None,       # or e.g. "condition"
@@ -61,7 +60,7 @@ gene_embeddings = gene_embeddings_full[emb_indices, :]   # (N_common, d_gene)
 del(dataset_full)
 
 vae_dataset = SingleCellVAEDataset(
-    adata_or_path=adata_path,
+    adata_or_path=adata[0:10000,:],
     gene_key=gene_key,
     layer=None,
     cond_key=None,            # or some condition column
@@ -77,51 +76,51 @@ assert n_genes == gene_embeddings.shape[0], (
 
 # 5. Build model and training
 
-cfg = VAEConfig(
-    n_genes=n_genes,
-    latent_dim=32,
-    hidden_dim=256,
-    n_hidden_layers=2,
-    n_conditions=None,   # or len(dataset.cond_categories)
-    cond_emb_dim=16,
-    kl_weight=1.0,
-    device="cuda",
-    epochs=50
-)
+# cfg = VAEConfig(
+#     n_genes=n_genes,
+#     latent_dim=32,
+#     hidden_dim=256,
+#     n_hidden_layers=2,
+#     n_conditions=None,   # or len(dataset.cond_categories)
+#     cond_emb_dim=16,
+#     kl_weight=1.0,
+#     device="cuda",
+#     epochs=50
+# )
 
-device = torch.device(cfg.device)
+device = torch.device('cuda')
 
 encoder = CBOWCellEncoder(
     gene_embeddings=gene_embeddings,
-    latent_dim=cfg.latent_dim,
-    hidden_dim=cfg.hidden_dim,
-    n_hidden_layers=cfg.n_hidden_layers,
-    n_conditions=cfg.n_conditions,
-    cond_emb_dim=cfg.cond_emb_dim,
+    latent_dim=32,
+    hidden_dim=256,
+    n_hidden_layers=2,
+    n_conditions=None,
+    cond_emb_dim=16,
     freeze_gene_embeddings=True,
     input_transform="log1p"
 )
 
 decoder = ZINBExpressionDecoder(
     n_genes=n_genes,
-    latent_dim=cfg.latent_dim,
-    hidden_dim=cfg.hidden_dim,
-    n_hidden_layers=cfg.n_hidden_layers,
-    n_conditions=cfg.n_conditions,
-    cond_emb_dim=cfg.cond_emb_dim,
+    latent_dim=32,
+    hidden_dim=256,
+    n_hidden_layers=2,
+    n_conditions=None,
+    cond_emb_dim=16,
 )
 
 model = GeneVAE(encoder, decoder).to(device)
 
 optimizer = torch.optim.Adam(
     filter(lambda p: p.requires_grad, model.parameters()),
-    lr=cfg.lr,
-    weight_decay=cfg.weight_decay,
+    lr=0.0003,
+    weight_decay=0.0,
 )
 
 dataloader = DataLoader(
     vae_dataset,
-    batch_size=cfg.batch_size,
+    batch_size=256,
     shuffle=True,
     num_workers=4,
     pin_memory=(device.type == "cuda"),
@@ -129,7 +128,7 @@ dataloader = DataLoader(
 
 # 6. Train a few epochs
 model.train()
-for epoch in range(cfg.epochs):
+for epoch in range(50):
     total_loss = 0.0
     total_batches = 0
 
@@ -158,7 +157,7 @@ for epoch in range(cfg.epochs):
 
         kl = kl_divergence_normal(mu_z, logvar_z, reduction="mean")
 
-        loss = recon_loss + cfg.kl_weight * kl
+        loss = recon_loss + 1.0 * kl
 
         optimizer.zero_grad()
         loss.backward()
@@ -168,7 +167,7 @@ for epoch in range(cfg.epochs):
         total_batches += 1
 
     avg_loss = total_loss / max(total_batches, 1)
-    print(f"[VAE-ZINB] Epoch {epoch+1}/{cfg.epochs} - loss: {avg_loss:.4f}")
+    print(f"[VAE-ZINB] Epoch {epoch+1}/{50} - loss: {avg_loss:.4f}")
 
 # 7. Extract predicted versus actual counts
 model.eval()
