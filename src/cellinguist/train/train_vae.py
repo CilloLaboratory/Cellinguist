@@ -24,8 +24,11 @@ from cellinguist.utils.vae_io import (
     subset_embeddings,
     save_vae_checkpoint,
     load_vae_checkpoint,
+    estimate_gene_means,
+    inv_softplus,
+    logit,
+    estimate_gene_means,
 )
-
 
 def train_vae(cfg: VAETrainConfig) -> str:
     set_seed(cfg.seed)
@@ -120,6 +123,59 @@ def train_vae(cfg: VAETrainConfig) -> str:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_last = str(ckpt_dir / f"{cfg.run_name}_last.ckpt")
 
+    # --- Decoder initialization (only if NOT resuming)
+    if not cfg.resume_from:
+        # 1) Initialize theta (gene-wise)
+        if hasattr(model.decoder, "log_theta"):
+            theta_init = torch.full((n_genes,), float(cfg.decoder_theta_init), dtype=torch.float32)
+            model.decoder.log_theta.data = inv_softplus(theta_init).to(model.decoder.log_theta.data.device)
+
+        # 2) Initialize pi head bias to logit(pi_init)
+        # Your decoder defines `mlp_pi = nn.Linear(..., n_genes)` so we can set bias.
+        if hasattr(model.decoder, "mlp_pi"):
+            # Access final Linear layer inside mlp_pi
+            pi_linear = model.decoder.mlp_pi.net[-1]
+
+            # Set bias so sigmoid(bias) ≈ pi_init
+            pi_bias = logit(cfg.decoder_pi_init)
+            pi_linear.bias.data.fill_(pi_bias)
+
+            # Optional but recommended: start with zero weights
+            torch.nn.init.zeros_(pi_linear.weight)
+
+        # 3) Initialize mu head bias
+        if hasattr(model.decoder, "mlp_mu"):
+            mu_linear = model.decoder.mlp_mu.net[-1]
+
+            if cfg.decoder_mu_init == "data_mean":
+                mean_x = estimate_gene_means(
+                    vae_dataset,
+                    max_cells=cfg.decoder_init_n_cells,
+                    batch_size=cfg.decoder_init_batch_size,
+                    num_workers=cfg.decoder_init_num_workers,  # I recommend 0 here
+                    device=None,
+                )
+                mean_x = torch.clamp(
+                    mean_x,
+                    min=1e-4,
+                    max=cfg.decoder_mu_init_cap,
+                )
+
+                mu_bias = inv_softplus(mean_x).to(mu_linear.bias.device)
+                mu_linear.bias.data.copy_(mu_bias)
+
+                # Optional but recommended
+                torch.nn.init.zeros_(mu_linear.weight)
+
+            elif cfg.decoder_mu_init == "constant":
+                mean0 = torch.tensor(cfg.decoder_mu_init_constant)
+                mean0 = torch.clamp(mean0,
+                    min=cfg.decoder_mu_init_eps,
+                    max=cfg.decoder_mu_init_cap)
+                b0 = inv_softplus(mean0).item()
+                mu_linear.bias.data.fill_(b0)
+                torch.nn.init.zeros_(mu_linear.weight)
+
     # --- Train loop
     model.train()
     for epoch in range(start_epoch, cfg.epochs):
@@ -143,8 +199,8 @@ def train_vae(cfg: VAETrainConfig) -> str:
 
             optimizer.zero_grad()
             loss.backward()
-            if cfg.grad_clip_norm and cfg.grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
+            # if cfg.grad_clip_norm and cfg.grad_clip_norm > 0:
+            #     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
             optimizer.step()
 
             total += float(loss.item())
@@ -176,12 +232,10 @@ def train_vae(cfg: VAETrainConfig) -> str:
     )
     return ckpt_last
 
-
 def run_vae_training_from_config(config_path: str) -> None:
     d = load_yaml(config_path)
     cfg = VAETrainConfig(**d)
     train_vae(cfg)
-
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Traine VAE from config file.")
