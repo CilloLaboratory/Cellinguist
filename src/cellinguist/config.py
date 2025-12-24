@@ -107,6 +107,17 @@ class VAETrainConfig:
     resume_from: Optional[str] = None
     save_every: int = 1
 
+    decoder_theta_init: float = 5.0          # initial theta (dispersion), gene-wise
+    decoder_pi_init: float = 0.9             # initial dropout prob pi (ZI prob)
+    decoder_mu_init: str = "data_mean"       # "data_mean" or "constant" or "none"
+    decoder_mu_init_constant: float = 0.2    # used if decoder_mu_init == "constant"
+    decoder_mu_init_cap: float = 10.0        # cap for gene-wise mean init
+    decoder_mu_init_eps: float = 1e-4        # lower bound for mean init
+
+    decoder_init_n_cells: int = 5000         # number of cells to estimate gene means from
+    decoder_init_batch_size: int = 256       # batch size for mean-estimation pass
+    decoder_init_num_workers: int = 0   
+
 @dataclass
 class VAEExportConfig:
     adata_path: str
