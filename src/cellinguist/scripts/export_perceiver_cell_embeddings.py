@@ -75,7 +75,7 @@ def export_perceiver_cell_embeddings(
     gene_key: str = "gene",
     layer: str | None = None,
     cond_key: str | None = None,
-    max_cells: int = 1000,
+    max_cells: int | None = None,
     batch_size: int = 64,
     num_workers: int = 4,
     device: str = "cuda",
@@ -113,7 +113,10 @@ def export_perceiver_cell_embeddings(
         pin_memory=(run_device.type == "cuda"),
     )
 
-    max_cells = min(int(max_cells), len(ds))
+    if max_cells is None:
+        max_cells = len(ds)
+    else:
+        max_cells = min(int(max_cells), len(ds))
     embeds = []
     cell_ids = []
     seen = 0
@@ -166,7 +169,12 @@ def main() -> None:
     parser.add_argument("--gene-key", default="gene", help="Gene column in adata.var (default: gene).")
     parser.add_argument("--layer", default=None, help="Expression layer in adata.layers (default: X).")
     parser.add_argument("--cond-key", default=None, help="Condition column in adata.obs.")
-    parser.add_argument("--max-cells", type=int, default=1000, help="Maximum cells to export (default: 1000).")
+    parser.add_argument(
+        "--max-cells",
+        type=int,
+        default=None,
+        help="Maximum cells to export (default: all cells).",
+    )
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size (default: 64).")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers (default: 4).")
     parser.add_argument("--device", default="cuda", help="Torch device (default: cuda).")
