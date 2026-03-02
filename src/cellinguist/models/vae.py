@@ -254,6 +254,9 @@ class PerceiverCellEncoder(nn.Module):
         n_conditions: Optional[int] = None,
         cond_emb_dim: int = 16,
         input_transform: str = "log1p",
+        library_norm: str = "size_factor",
+        library_norm_target_sum: float = 1e4,
+        library_norm_eps: float = 1e-8,
         perceiver_d_model: int = 256,
         perceiver_num_latents: int = 64,
         perceiver_num_cross_attn_heads: int = 8,
@@ -266,6 +269,15 @@ class PerceiverCellEncoder(nn.Module):
         self.n_genes = int(n_genes)
         self.latent_dim = int(latent_dim)
         self.input_transform = input_transform
+        self.library_norm = str(library_norm).lower()
+        self.library_norm_target_sum = float(library_norm_target_sum)
+        self.library_norm_eps = float(library_norm_eps)
+        if self.library_norm not in {"size_factor", "none"}:
+            raise ValueError(f"Unsupported library_norm: {library_norm}")
+        if self.library_norm_target_sum <= 0:
+            raise ValueError("library_norm_target_sum must be > 0.")
+        if self.library_norm_eps <= 0:
+            raise ValueError("library_norm_eps must be > 0.")
 
         d_model = int(perceiver_d_model)
         n_latents = int(perceiver_num_latents)
@@ -336,10 +348,16 @@ class PerceiverCellEncoder(nn.Module):
                 "Dataset gene order/shape does not match encoder setup."
             )
 
+        if self.library_norm == "size_factor":
+            libsize = x_expr.sum(dim=1, keepdim=True).clamp_min(self.library_norm_eps)
+            x_in = x_expr * (self.library_norm_target_sum / libsize)
+        else:
+            x_in = x_expr
+
         if self.input_transform == "log1p":
-            x_enc = torch.log1p(x_expr)
+            x_enc = torch.log1p(x_in)
         elif self.input_transform == "none":
-            x_enc = x_expr
+            x_enc = x_in
         else:
             raise ValueError(f"Unsupported input_transform: {self.input_transform}")
 

@@ -91,6 +91,9 @@ class VAETrainConfig:
     n_hidden_layers: int = 2
     cond_emb_dim: int = 16
     input_transform: str = "log1p"
+    library_norm: str = "size_factor"  # "size_factor" or "none" (Perceiver encoder)
+    library_norm_target_sum: float = 1e4
+    library_norm_eps: float = 1e-8
     freeze_gene_embeddings: bool = True
     perceiver_d_model: int = 256
     perceiver_num_latents: int = 64

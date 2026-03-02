@@ -71,6 +71,9 @@ def export_predictions(cfg: VAEExportConfig) -> None:
     n_hidden_layers = int(train_cfg.get("n_hidden_layers", 2))
     cond_emb_dim = int(train_cfg.get("cond_emb_dim", 16))
     input_transform = str(train_cfg.get("input_transform", "log1p"))
+    library_norm = str(train_cfg.get("library_norm", "size_factor"))
+    library_norm_target_sum = float(train_cfg.get("library_norm_target_sum", 1e4))
+    library_norm_eps = float(train_cfg.get("library_norm_eps", 1e-8))
     freeze_gene_embeddings = bool(train_cfg.get("freeze_gene_embeddings", True))
 
     if encoder_type == "cbow":
@@ -93,6 +96,9 @@ def export_predictions(cfg: VAEExportConfig) -> None:
             n_conditions=n_conditions,
             cond_emb_dim=cond_emb_dim,
             input_transform=input_transform,
+            library_norm=library_norm,
+            library_norm_target_sum=library_norm_target_sum,
+            library_norm_eps=library_norm_eps,
             perceiver_d_model=int(train_cfg.get("perceiver_d_model", 256)),
             perceiver_num_latents=int(train_cfg.get("perceiver_num_latents", 64)),
             perceiver_num_cross_attn_heads=int(train_cfg.get("perceiver_num_cross_attn_heads", 8)),
