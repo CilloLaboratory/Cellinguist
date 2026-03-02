@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
 import traceback
 from dataclasses import asdict
@@ -39,18 +40,50 @@ def _is_distributed() -> bool:
     return dist.is_available() and dist.is_initialized()
 
 
+def _early_log(msg: str) -> None:
+    print(f"[ddp-setup] {msg}", flush=True)
+
+
 def _setup_distributed(cfg_device: str) -> tuple[torch.device, int, int, bool]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size <= 1:
         return torch.device(cfg_device), 0, 1, False
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("Distributed training requires CUDA for this setup.")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = int(os.environ.get("RANK", str(local_rank)))
+    master_addr = os.environ.get("MASTER_ADDR", "unset")
+    master_port = os.environ.get("MASTER_PORT", "unset")
+    _early_log(
+        f"pre-init rank={rank} local_rank={local_rank} world_size={world_size} "
+        f"master={master_addr}:{master_port}"
+    )
 
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl", init_method="env://")
-    return torch.device("cuda", local_rank), dist.get_rank(), dist.get_world_size(), True
+    if not torch.cuda.is_available():
+        _early_log("CUDA unavailable; using gloo backend.")
+        backend = "gloo"
+        device = torch.device("cpu")
+    else:
+        torch.cuda.set_device(local_rank)
+        backend = os.environ.get("CELLINGUIST_DDP_BACKEND", "nccl").lower()
+        device = torch.device("cuda", local_rank)
+        _early_log(
+            f"cuda_visible={os.environ.get('CUDA_VISIBLE_DEVICES', 'all')} "
+            f"device_count={torch.cuda.device_count()} backend={backend}"
+        )
+
+    try:
+        dist.init_process_group(
+            backend=backend,
+            init_method="env://",
+            timeout=datetime.timedelta(minutes=5),
+        )
+        _early_log(f"init_process_group ok rank={dist.get_rank()} world_size={dist.get_world_size()}")
+    except Exception:
+        _early_log("init_process_group failed with exception:")
+        traceback.print_exc()
+        raise
+
+    return device, dist.get_rank(), dist.get_world_size(), True
 
 
 def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
