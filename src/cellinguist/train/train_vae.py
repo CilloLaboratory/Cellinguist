@@ -288,10 +288,15 @@ def train_vae(cfg: VAETrainConfig) -> str:
                             max=cfg.decoder_mu_init_cap,
                         )
                     else:
-                        mean_x = torch.empty((n_genes,), dtype=torch.float32)
+                        mean_x = torch.empty((n_genes,), dtype=torch.float32, device=device)
 
                     if is_ddp:
+                        # NCCL does not support CPU tensors for collectives.
+                        if is_main:
+                            mean_x = mean_x.to(device=device, dtype=torch.float32, non_blocking=True)
                         dist.broadcast(mean_x, src=0)
+                    elif mean_x.device != device:
+                        mean_x = mean_x.to(device=device, dtype=torch.float32, non_blocking=True)
 
                     mu_bias = inv_softplus(mean_x).to(mu_linear.bias.device)
                     mu_linear.bias.data.copy_(mu_bias)
