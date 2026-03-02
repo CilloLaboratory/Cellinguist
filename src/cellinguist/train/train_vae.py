@@ -12,6 +12,7 @@ from cellinguist.config import VAETrainConfig, load_yaml
 from cellinguist.data.datasets import SingleCellVAEDataset
 from cellinguist.models.vae import (
     CBOWCellEncoder,
+    PerceiverCellEncoder,
     ZINBExpressionDecoder,
     GeneVAE,
     zinb_negative_log_likelihood,
@@ -27,61 +28,95 @@ from cellinguist.utils.vae_io import (
     estimate_gene_means,
     inv_softplus,
     logit,
-    estimate_gene_means,
 )
 
 def train_vae(cfg: VAETrainConfig) -> str:
     set_seed(cfg.seed)
     device = torch.device(cfg.device)
+    encoder_type = str(cfg.encoder_type).lower()
+    if encoder_type not in {"cbow", "perceiver"}:
+        raise ValueError(f"Unsupported encoder_type: {cfg.encoder_type}. Use 'cbow' or 'perceiver'.")
 
-    # --- Load gene embeddings
-    genes_from_emb, emb_full = load_gene_embeddings_tsv(cfg.gene_emb_tsv)
-
-    # --- Probe expression genes (lightweight: read once, build a dataset)
+    # --- Load expression data once
     adata = ad.read_h5ad(cfg.adata_path)
-    ds_probe = SingleCellVAEDataset(
-        adata_or_path=adata,
-        gene_key=cfg.gene_key,
-        layer=cfg.layer,
-        cond_key=cfg.cond_key,
-        transform="none",
-    )
-    genes_expr = ds_probe.gene_order
 
-    print(f"Expression dataset: {len(genes_expr)} genes before intersection")
+    if encoder_type == "cbow":
+        if not cfg.gene_emb_tsv:
+            raise ValueError("gene_emb_tsv must be provided when encoder_type='cbow'.")
 
-    # --- Align genes in embedding order
-    genes_common = intersect_genes_in_embedding_order(genes_from_emb, genes_expr)
-    emb = subset_embeddings(genes_from_emb, emb_full, genes_common)
+        genes_from_emb, emb_full = load_gene_embeddings_tsv(cfg.gene_emb_tsv)
+        ds_probe = SingleCellVAEDataset(
+            adata_or_path=adata,
+            gene_key=cfg.gene_key,
+            layer=cfg.layer,
+            cond_key=cfg.cond_key,
+            transform="none",
+        )
+        genes_expr = ds_probe.gene_order
+        print(f"Expression dataset: {len(genes_expr)} genes before intersection")
 
-    # --- Rebuild dataset with aligned gene order
-    vae_dataset = SingleCellVAEDataset(
-        adata_or_path=adata,
-        gene_key=cfg.gene_key,
-        layer=cfg.layer,
-        cond_key=cfg.cond_key,
-        gene_order=genes_common,
-        transform="none",
-    )
-    n_cells, n_genes = vae_dataset.X.shape
-    print(f"VAE dataset after alignment: {n_cells} cells, {n_genes} genes")
-    assert n_genes == emb.shape[0]
+        genes_common = intersect_genes_in_embedding_order(genes_from_emb, genes_expr)
+        emb = subset_embeddings(genes_from_emb, emb_full, genes_common)
+
+        vae_dataset = SingleCellVAEDataset(
+            adata_or_path=adata,
+            gene_key=cfg.gene_key,
+            layer=cfg.layer,
+            cond_key=cfg.cond_key,
+            gene_order=genes_common,
+            transform="none",
+        )
+        n_cells, n_genes = vae_dataset.X.shape
+        print(f"VAE dataset after alignment: {n_cells} cells, {n_genes} genes")
+        assert n_genes == emb.shape[0]
+        gene_emb_source = cfg.gene_emb_tsv
+    else:
+        vae_dataset = SingleCellVAEDataset(
+            adata_or_path=adata,
+            gene_key=cfg.gene_key,
+            layer=cfg.layer,
+            cond_key=cfg.cond_key,
+            transform="none",
+        )
+        genes_common = vae_dataset.gene_order
+        n_cells, n_genes = vae_dataset.X.shape
+        print(f"VAE dataset: {n_cells} cells, {n_genes} genes (Perceiver encoder)")
+        emb = None
+        gene_emb_source = ""
 
     n_conditions = (
         len(vae_dataset.cond_categories) if vae_dataset.cond_categories is not None else None
     )
 
     # --- Build model
-    encoder = CBOWCellEncoder(
-        gene_embeddings=emb,
-        latent_dim=cfg.latent_dim,
-        hidden_dim=cfg.hidden_dim,
-        n_hidden_layers=cfg.n_hidden_layers,
-        n_conditions=n_conditions,
-        cond_emb_dim=cfg.cond_emb_dim,
-        freeze_gene_embeddings=cfg.freeze_gene_embeddings,
-        input_transform=cfg.input_transform,
-    )
+    if encoder_type == "cbow":
+        encoder = CBOWCellEncoder(
+            gene_embeddings=emb,
+            latent_dim=cfg.latent_dim,
+            hidden_dim=cfg.hidden_dim,
+            n_hidden_layers=cfg.n_hidden_layers,
+            n_conditions=n_conditions,
+            cond_emb_dim=cfg.cond_emb_dim,
+            freeze_gene_embeddings=cfg.freeze_gene_embeddings,
+            input_transform=cfg.input_transform,
+        )
+    else:
+        encoder = PerceiverCellEncoder(
+            n_genes=n_genes,
+            latent_dim=cfg.latent_dim,
+            hidden_dim=cfg.hidden_dim,
+            n_hidden_layers=cfg.n_hidden_layers,
+            n_conditions=n_conditions,
+            cond_emb_dim=cfg.cond_emb_dim,
+            input_transform=cfg.input_transform,
+            perceiver_d_model=cfg.perceiver_d_model,
+            perceiver_num_latents=cfg.perceiver_num_latents,
+            perceiver_num_cross_attn_heads=cfg.perceiver_num_cross_attn_heads,
+            perceiver_num_self_attn_heads=cfg.perceiver_num_self_attn_heads,
+            perceiver_num_self_attn_layers=cfg.perceiver_num_self_attn_layers,
+            perceiver_ff_mult=cfg.perceiver_ff_mult,
+            perceiver_dropout=cfg.perceiver_dropout,
+        )
     decoder = ZINBExpressionDecoder(
         n_genes=n_genes,
         latent_dim=cfg.latent_dim,
@@ -217,7 +252,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 epoch=epoch,
                 genes_common=genes_common,
                 config_snapshot=asdict(cfg),
-                gene_emb_source=cfg.gene_emb_tsv,
+                gene_emb_source=gene_emb_source,
             )
 
     # Final save
@@ -228,7 +263,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
         epoch=cfg.epochs - 1,
         genes_common=genes_common,
         config_snapshot=asdict(cfg),
-        gene_emb_source=cfg.gene_emb_tsv,
+        gene_emb_source=gene_emb_source,
     )
     return ckpt_last
 

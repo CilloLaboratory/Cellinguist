@@ -37,6 +37,78 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+class FeedForward(nn.Module):
+    def __init__(self, d_model: int, ff_mult: int = 4, dropout: float = 0.0) -> None:
+        super().__init__()
+        d_ff = int(d_model * ff_mult)
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        ff_mult: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm_ff = nn.LayerNorm(d_model)
+        self.ff = FeedForward(d_model=d_model, ff_mult=ff_mult, dropout=dropout)
+
+    def forward(self, latents: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
+        q = self.norm_q(latents)
+        kv = self.norm_kv(inputs)
+        attn_out, _ = self.attn(q, kv, kv, need_weights=False)
+        latents = latents + attn_out
+        latents = latents + self.ff(self.norm_ff(latents))
+        return latents
+
+
+class SelfAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        ff_mult: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.norm_attn = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm_ff = nn.LayerNorm(d_model)
+        self.ff = FeedForward(d_model=d_model, ff_mult=ff_mult, dropout=dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        qkv = self.norm_attn(x)
+        attn_out, _ = self.attn(qkv, qkv, qkv, need_weights=False)
+        x = x + attn_out
+        x = x + self.ff(self.norm_ff(x))
+        return x
+
+
 # ---------------------------------------------------------------------------
 # CBOWCellEncoder: expression-weighted CBOW + MLP to (mu, logvar)
 # ---------------------------------------------------------------------------
@@ -163,6 +235,135 @@ class CBOWCellEncoder(nn.Module):
 
         return mu, logvar
 
+
+class PerceiverCellEncoder(nn.Module):
+    """
+    Perceiver-style cell encoder:
+      1) Builds per-gene input tokens from expression + learned gene-id embeddings.
+      2) Uses latent queries with cross-attention to genes.
+      3) Applies latent self-attention blocks.
+      4) Pools latents and maps to (mu, logvar) for the VAE posterior.
+    """
+
+    def __init__(
+        self,
+        n_genes: int,
+        latent_dim: int,
+        hidden_dim: int,
+        n_hidden_layers: int,
+        n_conditions: Optional[int] = None,
+        cond_emb_dim: int = 16,
+        input_transform: str = "log1p",
+        perceiver_d_model: int = 256,
+        perceiver_num_latents: int = 64,
+        perceiver_num_cross_attn_heads: int = 8,
+        perceiver_num_self_attn_heads: int = 8,
+        perceiver_num_self_attn_layers: int = 4,
+        perceiver_ff_mult: int = 4,
+        perceiver_dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.n_genes = int(n_genes)
+        self.latent_dim = int(latent_dim)
+        self.input_transform = input_transform
+
+        d_model = int(perceiver_d_model)
+        n_latents = int(perceiver_num_latents)
+
+        if d_model % int(perceiver_num_cross_attn_heads) != 0:
+            raise ValueError("perceiver_d_model must be divisible by perceiver_num_cross_attn_heads.")
+        if d_model % int(perceiver_num_self_attn_heads) != 0:
+            raise ValueError("perceiver_d_model must be divisible by perceiver_num_self_attn_heads.")
+
+        self.expr_projection = nn.Sequential(
+            nn.Linear(1, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.gene_embedding = nn.Embedding(self.n_genes, d_model)
+        self.register_buffer("gene_indices", torch.arange(self.n_genes, dtype=torch.long))
+
+        self.latents = nn.Parameter(torch.randn(n_latents, d_model) * 0.02)
+        self.cross_attn = CrossAttentionBlock(
+            d_model=d_model,
+            n_heads=int(perceiver_num_cross_attn_heads),
+            ff_mult=int(perceiver_ff_mult),
+            dropout=float(perceiver_dropout),
+        )
+        self.self_attn_blocks = nn.ModuleList(
+            [
+                SelfAttentionBlock(
+                    d_model=d_model,
+                    n_heads=int(perceiver_num_self_attn_heads),
+                    ff_mult=int(perceiver_ff_mult),
+                    dropout=float(perceiver_dropout),
+                )
+                for _ in range(int(perceiver_num_self_attn_layers))
+            ]
+        )
+        self.final_norm = nn.LayerNorm(d_model)
+
+        if n_conditions is not None:
+            self.cond_embedding = nn.Embedding(n_conditions, cond_emb_dim)
+            cond_input_dim = cond_emb_dim
+        else:
+            self.cond_embedding = None
+            cond_input_dim = 0
+
+        encoder_input_dim = d_model + cond_input_dim
+        self.mlp_mu = MLP(
+            input_dim=encoder_input_dim,
+            output_dim=self.latent_dim,
+            hidden_dim=hidden_dim,
+            n_hidden_layers=n_hidden_layers,
+        )
+        self.mlp_logvar = MLP(
+            input_dim=encoder_input_dim,
+            output_dim=self.latent_dim,
+            hidden_dim=hidden_dim,
+            n_hidden_layers=n_hidden_layers,
+        )
+
+    def forward(
+        self,
+        x_expr: torch.Tensor,
+        cond_idx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bsz, n_genes = x_expr.shape
+        if n_genes != self.n_genes:
+            raise ValueError(
+                f"Expected {self.n_genes} genes, but got {n_genes}. "
+                "Dataset gene order/shape does not match encoder setup."
+            )
+
+        if self.input_transform == "log1p":
+            x_enc = torch.log1p(x_expr)
+        elif self.input_transform == "none":
+            x_enc = x_expr
+        else:
+            raise ValueError(f"Unsupported input_transform: {self.input_transform}")
+
+        expr_tokens = self.expr_projection(x_enc.unsqueeze(-1))  # (B, G, D)
+        gene_tokens = self.gene_embedding(self.gene_indices).unsqueeze(0)  # (1, G, D)
+        inputs = expr_tokens + gene_tokens
+
+        latents = self.latents.unsqueeze(0).expand(bsz, -1, -1)  # (B, L, D)
+        latents = self.cross_attn(latents, inputs)
+        for block in self.self_attn_blocks:
+            latents = block(latents)
+
+        h_cell = self.final_norm(latents.mean(dim=1))  # (B, D)
+
+        if self.cond_embedding is not None and cond_idx is not None:
+            c = self.cond_embedding(cond_idx)
+            h_in = torch.cat([h_cell, c], dim=-1)
+        else:
+            h_in = h_cell
+
+        mu = self.mlp_mu(h_in)
+        logvar = self.mlp_logvar(h_in)
+        return mu, logvar
+
 # ---------------------------------------------------------------------------
 # ExpressionDecoder: z (+ cond) -> reconstructed expression
 # ---------------------------------------------------------------------------
@@ -248,8 +449,8 @@ class GeneVAE(nn.Module):
 
     def __init__(
         self,
-        encoder: CBOWCellEncoder,
-        decoder: ExpressionDecoder,
+        encoder: nn.Module,
+        decoder: nn.Module,
     ) -> None:
         super().__init__()
         self.encoder = encoder

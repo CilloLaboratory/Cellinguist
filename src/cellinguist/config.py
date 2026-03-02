@@ -82,7 +82,9 @@ class VAETrainConfig:
     layer: Optional[str] = None
     cond_key: Optional[str] = None
 
+    # Used only when encoder_type == "cbow".
     gene_emb_tsv: str = ""
+    encoder_type: str = "perceiver"  # "perceiver" or "cbow"
 
     latent_dim: int = 32
     hidden_dim: int = 256
@@ -90,6 +92,13 @@ class VAETrainConfig:
     cond_emb_dim: int = 16
     input_transform: str = "log1p"
     freeze_gene_embeddings: bool = True
+    perceiver_d_model: int = 256
+    perceiver_num_latents: int = 64
+    perceiver_num_cross_attn_heads: int = 8
+    perceiver_num_self_attn_heads: int = 8
+    perceiver_num_self_attn_layers: int = 4
+    perceiver_ff_mult: int = 4
+    perceiver_dropout: float = 0.0
 
     kl_weight: float = 1.0
 
@@ -125,6 +134,7 @@ class VAEExportConfig:
     layer: Optional[str] = None
     cond_key: Optional[str] = None
 
+    # Used only when checkpoint/config indicates encoder_type == "cbow".
     gene_emb_tsv: str = ""
     checkpoint_path: str = ""
     out_pred_tsv_gz: str = "pred_mu.tsv.gz"

@@ -3,7 +3,8 @@ gene_key: "gene"
 layer: null
 cond_key: null
 
-gene_emb_tsv: "/home/arc85/Desktop/cellinguist_results_251125/01_cytokine_testing_251125/03_output/cytokines_test_cbow_full_genome_gene_embeddings_251125.tsv.gz"
+# Optional for CBOW checkpoints; not used for Perceiver checkpoints.
+gene_emb_tsv: ""
 
 checkpoint_path: "/home/arc85/Desktop/cellinguist_results_251125/vae_ckpts/cytokines_vae_zinb_last.ckpt"
 out_pred_tsv_gz: "/home/arc85/Desktop/cellinguist_results_251125/01_cytokine_testing_251125/03_output/vae_pred_mu.tsv.gz"

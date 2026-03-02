@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import gzip
-from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +14,7 @@ from cellinguist.config import VAEExportConfig, load_yaml
 from cellinguist.data.datasets import SingleCellVAEDataset
 from cellinguist.models.vae import (
     CBOWCellEncoder,
+    PerceiverCellEncoder,
     ZINBExpressionDecoder,
     GeneVAE,
 )
@@ -28,28 +28,17 @@ from cellinguist.utils.vae_io import (
 def export_predictions(cfg: VAEExportConfig) -> None:
     device = torch.device(cfg.device)
 
-    # Load checkpoint first to get genes_common + config
-    # We'll build model after we know dims.
-    dummy_model = None
-
-    # Load embeddings
-    genes_from_emb, emb_full = load_gene_embeddings_tsv(cfg.gene_emb_tsv)
-
-    # Load adata
-    adata = ad.read_h5ad(cfg.adata_path)
-
-    # We need genes_common from checkpoint, so build a temporary model after reading ckpt.
-    # Strategy:
-    # 1) Read ckpt raw
+    # Read checkpoint raw for architecture + gene ordering metadata
     ckpt_raw = torch.load(cfg.checkpoint_path, map_location="cpu")
     genes_common = ckpt_raw["genes_common"]
     gene_emb_source = ckpt_raw.get("gene_emb_source", None)
+    train_cfg = ckpt_raw.get("config", {})
+    encoder_type = str(train_cfg.get("encoder_type", "cbow")).lower()
+    if encoder_type not in {"cbow", "perceiver"}:
+        raise ValueError(f"Unsupported encoder_type in checkpoint: {encoder_type}")
 
-    # Subset embeddings to genes_common
-    emb = subset_embeddings(genes_from_emb, emb_full, genes_common)
-    n_genes = emb.shape[0]
-
-    # Build dataset aligned to checkpoint genes
+    # Load adata and align by checkpoint gene order
+    adata = ad.read_h5ad(cfg.adata_path)
     ds = SingleCellVAEDataset(
         adata_or_path=adata,
         gene_key=cfg.gene_key,
@@ -58,13 +47,26 @@ def export_predictions(cfg: VAEExportConfig) -> None:
         gene_order=genes_common,
         transform="none",
     )
+    n_genes = ds.X.shape[1]
+
+    emb = None
+    if encoder_type == "cbow":
+        emb_path = cfg.gene_emb_tsv or gene_emb_source
+        if not emb_path:
+            raise ValueError(
+                "gene_emb_tsv is required to export with a CBOW checkpoint "
+                "when checkpoint does not include a gene_emb_source path."
+            )
+        genes_from_emb, emb_full = load_gene_embeddings_tsv(emb_path)
+        emb = subset_embeddings(genes_from_emb, emb_full, genes_common)
+        if emb.shape[0] != n_genes:
+            raise ValueError("Checkpoint genes and embedding genes are misaligned.")
 
     n_conditions = (
         len(ds.cond_categories) if ds.cond_categories is not None else None
     )
 
     # Rebuild model with same architecture as training (use checkpoint config if present)
-    train_cfg = ckpt_raw.get("config", {})
     latent_dim = int(train_cfg.get("latent_dim", 32))
     hidden_dim = int(train_cfg.get("hidden_dim", 256))
     n_hidden_layers = int(train_cfg.get("n_hidden_layers", 2))
@@ -72,16 +74,34 @@ def export_predictions(cfg: VAEExportConfig) -> None:
     input_transform = str(train_cfg.get("input_transform", "log1p"))
     freeze_gene_embeddings = bool(train_cfg.get("freeze_gene_embeddings", True))
 
-    encoder = CBOWCellEncoder(
-        gene_embeddings=emb,
-        latent_dim=latent_dim,
-        hidden_dim=hidden_dim,
-        n_hidden_layers=n_hidden_layers,
-        n_conditions=n_conditions,
-        cond_emb_dim=cond_emb_dim,
-        freeze_gene_embeddings=freeze_gene_embeddings,
-        input_transform=input_transform,
-    )
+    if encoder_type == "cbow":
+        encoder = CBOWCellEncoder(
+            gene_embeddings=emb,
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            n_hidden_layers=n_hidden_layers,
+            n_conditions=n_conditions,
+            cond_emb_dim=cond_emb_dim,
+            freeze_gene_embeddings=freeze_gene_embeddings,
+            input_transform=input_transform,
+        )
+    else:
+        encoder = PerceiverCellEncoder(
+            n_genes=n_genes,
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            n_hidden_layers=n_hidden_layers,
+            n_conditions=n_conditions,
+            cond_emb_dim=cond_emb_dim,
+            input_transform=input_transform,
+            perceiver_d_model=int(train_cfg.get("perceiver_d_model", 256)),
+            perceiver_num_latents=int(train_cfg.get("perceiver_num_latents", 64)),
+            perceiver_num_cross_attn_heads=int(train_cfg.get("perceiver_num_cross_attn_heads", 8)),
+            perceiver_num_self_attn_heads=int(train_cfg.get("perceiver_num_self_attn_heads", 8)),
+            perceiver_num_self_attn_layers=int(train_cfg.get("perceiver_num_self_attn_layers", 4)),
+            perceiver_ff_mult=int(train_cfg.get("perceiver_ff_mult", 4)),
+            perceiver_dropout=float(train_cfg.get("perceiver_dropout", 0.0)),
+        )
     decoder = ZINBExpressionDecoder(
         n_genes=n_genes,
         latent_dim=latent_dim,
@@ -150,7 +170,12 @@ def export_predictions(cfg: VAEExportConfig) -> None:
         df.to_csv(f, sep="\t", index=False)
 
     print(f"[export] Wrote predicted mu to: {out_path}")
-    if gene_emb_source is not None and gene_emb_source != cfg.gene_emb_tsv:
+    if (
+        encoder_type == "cbow"
+        and cfg.gene_emb_tsv
+        and gene_emb_source is not None
+        and gene_emb_source != cfg.gene_emb_tsv
+    ):
         print("[export] WARNING: checkpoint gene_emb_source differs from config gene_emb_tsv.")
 
 

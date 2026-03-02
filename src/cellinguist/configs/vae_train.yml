@@ -3,7 +3,10 @@ gene_key: "gene"
 layer: null
 cond_key: null
 
-gene_emb_tsv: "/home/arc85/Desktop/cellinguist_results_251125/01_cytokine_testing_251125/03_output/cytokines_test_cbow_full_genome_gene_embeddings_251125.tsv.gz"
+# encoder backbone: "perceiver" (default) or "cbow"
+encoder_type: "perceiver"
+# Required only if encoder_type: "cbow"
+gene_emb_tsv: ""
 
 # model
 latent_dim: 32
@@ -12,6 +15,13 @@ n_hidden_layers: 2
 cond_emb_dim: 16
 input_transform: "log1p"
 freeze_gene_embeddings: true
+perceiver_d_model: 256
+perceiver_num_latents: 64
+perceiver_num_cross_attn_heads: 8
+perceiver_num_self_attn_heads: 8
+perceiver_num_self_attn_layers: 4
+perceiver_ff_mult: 4
+perceiver_dropout: 0.0
 
 # loss
 kl_weight: 1.0
