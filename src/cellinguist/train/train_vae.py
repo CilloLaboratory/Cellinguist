@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import traceback
 from dataclasses import asdict
 from pathlib import Path
 
@@ -56,17 +57,28 @@ def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
+def _log(rank: int, msg: str) -> None:
+    print(f"[rank {rank}] {msg}", flush=True)
+
+
 def train_vae(cfg: VAETrainConfig) -> str:
     device, rank, world_size, is_ddp = _setup_distributed(cfg.device)
 
     try:
+        _log(
+            rank,
+            f"startup: ddp={is_ddp} world_size={world_size} device={device} "
+            f"cfg_num_workers={cfg.num_workers} resume_from={cfg.resume_from}",
+        )
         seed = None if cfg.seed is None else int(cfg.seed) + rank
         set_seed(seed)
+        _log(rank, f"seed set to {seed}")
 
         is_main = rank == 0
         encoder_type = str(cfg.encoder_type).lower()
         if encoder_type not in {"cbow", "perceiver"}:
             raise ValueError(f"Unsupported encoder_type: {cfg.encoder_type}. Use 'cbow' or 'perceiver'.")
+        _log(rank, f"encoder_type={encoder_type}")
 
         if encoder_type == "cbow":
             if not cfg.gene_emb_tsv:
@@ -117,6 +129,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 print(f"VAE dataset: {n_cells} cells, {n_genes} genes (Perceiver encoder)")
             emb = None
             gene_emb_source = ""
+        _log(rank, f"dataset ready: n_cells={n_cells} n_genes={n_genes}")
 
         n_conditions = (
             len(vae_dataset.cond_categories) if vae_dataset.cond_categories is not None else None
@@ -159,9 +172,11 @@ def train_vae(cfg: VAETrainConfig) -> str:
             cond_emb_dim=cfg.cond_emb_dim,
         )
         model: torch.nn.Module = GeneVAE(encoder, decoder).to(device)
+        _log(rank, "model built")
 
         if is_ddp:
             model = DDP(model, device_ids=[device.index], output_device=device.index)
+            _log(rank, "DDP wrapper initialized")
 
         raw_model = _unwrap(model)
 
@@ -179,6 +194,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
             ckpt_genes = ckpt.get("genes_common", None)
             if ckpt_genes is not None and ckpt_genes != genes_common:
                 raise ValueError("genes_common mismatch between checkpoint and current data/embeddings.")
+        _log(rank, f"checkpoint state ready: start_epoch={start_epoch}")
 
         sampler = None
         if is_ddp:
@@ -188,20 +204,28 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 rank=rank,
                 shuffle=True,
             )
+            _log(rank, "distributed sampler ready")
+
+        # Safer DDP default: avoid worker subprocesses unless explicitly requested >0.
+        effective_num_workers = int(cfg.num_workers)
+        if is_ddp and effective_num_workers <= 0:
+            effective_num_workers = 0
 
         dl = DataLoader(
             vae_dataset,
             batch_size=cfg.batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
-            num_workers=cfg.num_workers,
+            num_workers=effective_num_workers,
             pin_memory=(device.type == "cuda"),
-            persistent_workers=cfg.num_workers > 0,
+            persistent_workers=effective_num_workers > 0,
         )
+        _log(rank, f"dataloader ready: batch_size={cfg.batch_size} num_workers={effective_num_workers}")
 
         ckpt_dir = Path(cfg.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         ckpt_last = str(ckpt_dir / f"{cfg.run_name}_last.ckpt")
+        _log(rank, f"checkpoint path={ckpt_last}")
 
         if not cfg.resume_from:
             if hasattr(raw_model.decoder, "log_theta"):
@@ -252,8 +276,10 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 dist.broadcast(p.data, src=0)
             for b in raw_model.buffers():
                 dist.broadcast(b.data, src=0)
+            _log(rank, "initial parameter/buffer broadcast complete")
 
         model.train()
+        _log(rank, f"training loop start: epochs={cfg.epochs} start_epoch={start_epoch}")
         for epoch in range(start_epoch, cfg.epochs):
             if sampler is not None:
                 sampler.set_epoch(epoch)
@@ -314,9 +340,15 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 gene_emb_source=gene_emb_source,
             )
 
+        _log(rank, "train_vae completed")
         return ckpt_last
+    except Exception:
+        _log(rank, "fatal exception in train_vae")
+        traceback.print_exc()
+        raise
     finally:
         if _is_distributed():
+            _log(rank, "destroying process group")
             dist.destroy_process_group()
 
 
