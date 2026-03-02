@@ -1,7 +1,6 @@
 from torch.utils.data import DataLoader
 import torch
 import pandas as pd
-import anndata as ad
 import numpy as np
 import gzip
 
@@ -29,9 +28,8 @@ print(f"Loaded gene embeddings for {n_genes} genes, dim={d_gene}")
 # 2. Load data
 adata_path = "/home/arc85/Desktop/Cellinguist/cytokine_dict_ser_sub_full_genes_ad_251118.h5ad"
 gene_key = "gene" 
-adata = ad.read_h5ad(adata_path)
 dataset_full = SingleCellVAEDataset(
-    adata_or_path=adata[0:1000,:],
+    adata_or_path=adata_path,
     gene_key=gene_key,
     layer=None,
     cond_key=None,       # or e.g. "condition"
@@ -171,4 +169,3 @@ for epoch in range(cfg.epochs):
 
     avg_loss = total_loss / max(total_batches, 1)
     print(f"[VAE-ZINB] Epoch {epoch+1}/{cfg.epochs} - loss: {avg_loss:.4f}")
-
