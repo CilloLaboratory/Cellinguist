@@ -567,60 +567,127 @@ class SingleCellVAEDataset(Dataset):
         cond_key: Optional[str] = None,
         gene_order: Optional[list[str]] = None,
         transform: str = "log1p",
+        backed: bool = True,
     ) -> None:
         super().__init__()
-        if isinstance(adata_or_path, ad.AnnData):
-            adata = adata_or_path
-        else:
-            adata = ad.read_h5ad(adata_or_path)
-        self.adata = adata
-
-        # Choose expression matrix
-        if layer is None:
-            X = adata.X
-        else:
-            X = adata.layers[layer]
-
-        X = X.astype(np.float32)
-        if transform == "log1p":
-            X = np.log1p(X)
-        elif transform == "none":
-            pass
-        else:
+        self.layer = layer
+        self.transform = str(transform)
+        if self.transform not in {"log1p", "none"}:
             raise ValueError(f"Unsupported transform: {transform}")
+        self._backed = bool(backed)
+        self._adata = None
 
-        # Ensure dense
-        if not isinstance(X, np.ndarray):
-            X = X.toarray().astype(np.float32)
-        self.X = X  # (N, G)
+        if isinstance(adata_or_path, ad.AnnData):
+            self._adata = adata_or_path
+            self._adata_path = None
+            adata_probe = self._adata
+            self._backed = False
+        else:
+            self._adata_path = str(adata_or_path)
+            read_kwargs = {"backed": "r"} if self._backed else {}
+            adata_probe = ad.read_h5ad(self._adata_path, **read_kwargs)
 
-        # Optionally reorder genes to match a target order (e.g. CBOW vocab order)
+        if gene_key not in adata_probe.var.columns:
+            raise ValueError(
+                f"gene_key '{gene_key}' not found in adata.var. "
+                f"Available columns: {list(adata_probe.var.columns)}"
+            )
+        if layer is not None and layer not in adata_probe.layers:
+            raise ValueError(
+                f"Layer '{layer}' not found in adata.layers. "
+                f"Available: {list(adata_probe.layers.keys())}"
+            )
+
+        self.n_cells = int(adata_probe.n_obs)
+        self.obs_names = adata_probe.obs_names.astype(str).to_numpy()
+        var_genes = adata_probe.var[gene_key].astype(str).to_list()
+
         if gene_order is not None:
-            # adata.var[gene_key] should list genes
-            var_genes = self.adata.var[gene_key].astype(str).to_list()
             idx_map = {g: i for i, g in enumerate(var_genes)}
             indices = [idx_map[g] for g in gene_order]
-            self.X = self.X[:, indices]
-            self.gene_order = gene_order
+            self._gene_indices = np.asarray(indices, dtype=np.int64)
+            self.gene_order = list(gene_order)
         else:
-            self.gene_order = self.adata.var[gene_key].astype(str).to_list()
+            self._gene_indices = None
+            self.gene_order = var_genes
+        self.n_genes = len(self.gene_order)
 
-        # Condition
         if cond_key is not None:
-            cond_series = self.adata.obs[cond_key].astype("category")
+            if cond_key not in adata_probe.obs.columns:
+                raise ValueError(
+                    f"cond_key '{cond_key}' not found in adata.obs. "
+                    f"Available columns: {list(adata_probe.obs.columns)}"
+                )
+            cond_series = adata_probe.obs[cond_key].astype("category")
             self.cond_categories = list(cond_series.cat.categories)
             self.cond_idx = cond_series.cat.codes.to_numpy().astype(np.int64)
         else:
             self.cond_categories = None
             self.cond_idx = None
 
+        if (
+            isinstance(adata_or_path, str)
+            and self._backed
+            and getattr(adata_probe, "isbacked", False)
+        ):
+            adata_probe.file.close()
+
+    def _ensure_adata(self):
+        if self._adata is not None:
+            return self._adata
+        if self._adata_path is None:
+            raise RuntimeError("AnnData source is not available.")
+        read_kwargs = {"backed": "r"} if self._backed else {}
+        self._adata = ad.read_h5ad(self._adata_path, **read_kwargs)
+        return self._adata
+
+    def _get_row(self, idx: int) -> np.ndarray:
+        adata = self._ensure_adata()
+        if self.layer is None:
+            row = adata.X[idx]
+        else:
+            row = adata.layers[self.layer][idx]
+
+        if sp is not None and sp.issparse(row):
+            x = np.asarray(row.toarray()).ravel()
+        else:
+            x = np.asarray(row).ravel()
+
+        x = x.astype(np.float32, copy=False)
+        if self._gene_indices is not None:
+            x = x[self._gene_indices]
+        if self.transform == "log1p":
+            x = np.log1p(x)
+        return x
+
     def __len__(self) -> int:
-        return self.X.shape[0]
+        return self.n_cells
 
     def __getitem__(self, idx: int):
-        x = torch.from_numpy(self.X[idx])  # (G,)
+        x = torch.from_numpy(self._get_row(idx))
         if self.cond_idx is not None:
             c = torch.tensor(self.cond_idx[idx], dtype=torch.long)
             return {"x_expr": x, "cond_idx": c}
         else:
             return {"x_expr": x}
+
+    @property
+    def adata(self):
+        return self._ensure_adata()
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        if self._adata_path is not None:
+            state["_adata"] = None
+        return state
+
+    def __del__(self):
+        if (
+            self._adata is not None
+            and getattr(self._adata, "isbacked", False)
+            and getattr(self._adata, "file", None) is not None
+        ):
+            try:
+                self._adata.file.close()
+            except Exception:
+                pass

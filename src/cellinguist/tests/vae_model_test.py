@@ -68,7 +68,7 @@ vae_dataset = SingleCellVAEDataset(
     transform="none", # <--- none for ZINB model, log-transform inside encoder
 )
 
-n_cells, n_genes = vae_dataset.X.shape
+n_cells, n_genes = vae_dataset.n_cells, vae_dataset.n_genes
 print(f"VAE dataset after alignment: {n_cells} cells, {n_genes} genes")
 assert n_genes == gene_embeddings.shape[0], (
     f"Dataset has {n_genes} genes, embeddings have {gene_embeddings.shape[0]}"
