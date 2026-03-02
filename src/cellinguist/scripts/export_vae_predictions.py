@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-import anndata as ad
 
 from cellinguist.config import VAEExportConfig, load_yaml
 from cellinguist.data.datasets import SingleCellVAEDataset
@@ -37,17 +36,17 @@ def export_predictions(cfg: VAEExportConfig) -> None:
     if encoder_type not in {"cbow", "perceiver"}:
         raise ValueError(f"Unsupported encoder_type in checkpoint: {encoder_type}")
 
-    # Load adata and align by checkpoint gene order
-    adata = ad.read_h5ad(cfg.adata_path)
+    # Build a lazy dataset aligned by checkpoint gene order.
     ds = SingleCellVAEDataset(
-        adata_or_path=adata,
+        adata_or_path=cfg.adata_path,
         gene_key=cfg.gene_key,
         layer=cfg.layer,
         cond_key=cfg.cond_key,
         gene_order=genes_common,
         transform="none",
+        backed=True,
     )
-    n_genes = ds.X.shape[1]
+    n_genes = ds.n_genes
 
     emb = None
     if encoder_type == "cbow":
@@ -152,10 +151,10 @@ def export_predictions(cfg: VAEExportConfig) -> None:
             b = x.shape[0]
             take = min(b, max_cells - seen)
             preds.append(mu_np[:take])
-            # ds.adata.obs_names is aligned to dataset order
+            # Dataset order matches source obs order.
             start = seen
             stop = seen + take
-            cell_ids.extend(ds.adata.obs_names[start:stop].tolist())
+            cell_ids.extend(ds.obs_names[start:stop].tolist())
 
             seen += take
 
