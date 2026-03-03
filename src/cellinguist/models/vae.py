@@ -350,16 +350,15 @@ class PerceiverCellEncoder(nn.Module):
 
         if self.library_norm == "size_factor":
             libsize = x_expr.sum(dim=1, keepdim=True).clamp_min(self.library_norm_eps)
-            x_in = x_expr * (self.library_norm_target_sum / libsize)
+            x_norm = x_expr * (self.library_norm_target_sum / libsize)
+            x_enc = torch.log1p(x_norm)
         else:
-            x_in = x_expr
-
-        if self.input_transform == "log1p":
-            x_enc = torch.log1p(x_in)
-        elif self.input_transform == "none":
-            x_enc = x_in
-        else:
-            raise ValueError(f"Unsupported input_transform: {self.input_transform}")
+            if self.input_transform == "log1p":
+                x_enc = torch.log1p(x_expr)
+            elif self.input_transform == "none":
+                x_enc = x_expr
+            else:
+                raise ValueError(f"Unsupported input_transform: {self.input_transform}")
 
         expr_tokens = self.expr_projection(x_enc.unsqueeze(-1))  # (B, G, D)
         gene_tokens = self.gene_embedding(self.gene_indices).unsqueeze(0)  # (1, G, D)
