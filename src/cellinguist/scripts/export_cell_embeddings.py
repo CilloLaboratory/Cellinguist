@@ -67,7 +67,15 @@ def main() -> None:
     parser.add_argument(
         "--adata",
         required=True,
-        help="Path to input .h5ad file (same one used for CBOW training).",
+        help="Path to input .h5ad file whose cells will be embedded.",
+    )
+    parser.add_argument(
+        "--vocab-adata",
+        default=None,
+        help=(
+            "Optional reference .h5ad used to rebuild the original CBOW token vocabulary. "
+            "Use this when --adata is a gene-subset view (e.g., HVGs) of the training data."
+        ),
     )
     parser.add_argument(
         "--embeddings",
@@ -121,15 +129,16 @@ def main() -> None:
     args = parser.parse_args()
 
     adata_path = args.adata
+    vocab_adata_path = args.vocab_adata if args.vocab_adata is not None else adata_path
     emb_path = args.embeddings
     out_path = Path(args.out)
 
     # 1. Load token embeddings
     token_embeddings = load_gene_embeddings(emb_path, map_location="cpu")
 
-    # 2. Rebuild SingleCellDataset with same tokenization settings used during CBOW training
-    ds = SingleCellDataset(
-        adata_or_path=adata_path,
+    # 2. Rebuild vocabulary from the training/reference dataset.
+    vocab_ds = SingleCellDataset(
+        adata_or_path=vocab_adata_path,
         gene_key=args.gene_key,
         cond_key=args.cond_key,
         layer=args.layer,
@@ -140,17 +149,30 @@ def main() -> None:
         min_token_count=args.min_token_count,
     )
 
-    if ds.vocab_size != token_embeddings.shape[0]:
+    if vocab_ds.vocab_size != token_embeddings.shape[0]:
         raise ValueError(
-            f"Vocab size ({ds.vocab_size}) does not match embedding matrix rows "
-            f"({token_embeddings.shape[0]}). Make sure you're using the same "
-            f"dataset/tokenization settings as during CBOW training."
+            f"Reference vocab size ({vocab_ds.vocab_size}) does not match embedding matrix rows "
+            f"({token_embeddings.shape[0]}). Make sure --vocab-adata and tokenization settings "
+            f"match CBOW training."
         )
 
-    # 3. Compute cell embeddings
+    # 3. Encode requested cells with the fixed training vocab. Missing tokens are skipped.
+    ds = SingleCellDataset(
+        adata_or_path=adata_path,
+        gene_key=args.gene_key,
+        cond_key=args.cond_key,
+        layer=args.layer,
+        n_bins=args.n_bins,
+        shuffle_tokens=not args.no_shuffle_tokens,
+        min_expr=args.min_expr,
+        token_to_id=vocab_ds.token_to_id,
+        min_token_count=args.min_token_count,
+    )
+
+    # 4. Compute cell embeddings
     cell_embs = compute_cell_embeddings(ds, token_embeddings)
 
-    # 4. Build DataFrame with cell IDs
+    # 5. Build DataFrame with cell IDs
     cell_ids = np.asarray(ds.adata.obs_names)
     if cell_ids.shape[0] != cell_embs.shape[0]:
         raise ValueError(
