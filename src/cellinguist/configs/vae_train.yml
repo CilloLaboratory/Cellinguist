@@ -2,6 +2,7 @@ adata_path: "/home/arc85/Desktop/Cellinguist/cytokine_dict_ser_sub_full_genes_ad
 gene_key: "gene"
 layer: null
 cond_key: null
+batch_key: null
 backed: true
 
 # encoder backbone: "perceiver" (default) or "cbow"
@@ -41,6 +42,12 @@ metric_k_neg: 20
 runin_batches: 0
 runin_kl_weight: 0.0
 runin_metric_weight: 0.0
+batch_invariance_method: "none"
+batch_invariance_weight: 0.0
+batch_adv_grl_lambda: 1.0
+batch_adv_hidden_dim: 128
+batch_adv_n_hidden_layers: 1
+batch_invariance_warmup_epochs: 0
 
 # training
 lr: 0.0003

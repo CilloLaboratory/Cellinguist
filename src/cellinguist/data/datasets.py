@@ -556,7 +556,9 @@ class SingleCellVAEDataset(Dataset):
 
     Returns:
       - x_expr: (G,) tensor of expression (e.g., log1p normalized counts)
-      - cond_idx: Optional scalar LongTensor (if cond_key is given)
+      - libsize: scalar FloatTensor (raw-count library size)
+      - batch_idx: Optional scalar LongTensor (if batch/cond key is given)
+      - cond_idx: Backward-compatible alias of batch_idx
     """
 
     def __init__(
@@ -565,6 +567,7 @@ class SingleCellVAEDataset(Dataset):
         gene_key: str = "gene",
         layer: Optional[str] = None,
         cond_key: Optional[str] = None,
+        batch_key: Optional[str] = None,
         gene_order: Optional[list[str]] = None,
         transform: str = "log1p",
         backed: bool = True,
@@ -612,18 +615,30 @@ class SingleCellVAEDataset(Dataset):
             self.gene_order = var_genes
         self.n_genes = len(self.gene_order)
 
-        if cond_key is not None:
-            if cond_key not in adata_probe.obs.columns:
+        effective_batch_key = batch_key if batch_key is not None else cond_key
+        if batch_key is not None and cond_key is not None and batch_key != cond_key:
+            raise ValueError(
+                f"Received both batch_key='{batch_key}' and cond_key='{cond_key}', but they differ. "
+                "Use one key or set them to the same value."
+            )
+
+        self.batch_key = effective_batch_key
+        self.cond_key = effective_batch_key
+        if effective_batch_key is not None:
+            if effective_batch_key not in adata_probe.obs.columns:
                 raise ValueError(
-                    f"cond_key '{cond_key}' not found in adata.obs. "
+                    f"batch/cond key '{effective_batch_key}' not found in adata.obs. "
                     f"Available columns: {list(adata_probe.obs.columns)}"
                 )
-            cond_series = adata_probe.obs[cond_key].astype("category")
-            self.cond_categories = list(cond_series.cat.categories)
-            self.cond_idx = cond_series.cat.codes.to_numpy().astype(np.int64)
+            cond_series = adata_probe.obs[effective_batch_key].astype("category")
+            self.batch_categories = list(cond_series.cat.categories)
+            self.batch_idx = cond_series.cat.codes.to_numpy().astype(np.int64)
         else:
-            self.cond_categories = None
-            self.cond_idx = None
+            self.batch_categories = None
+            self.batch_idx = None
+        # Backward-compatible aliases.
+        self.cond_categories = self.batch_categories
+        self.cond_idx = self.batch_idx
 
         if (
             isinstance(adata_or_path, str)
@@ -641,7 +656,7 @@ class SingleCellVAEDataset(Dataset):
         self._adata = ad.read_h5ad(self._adata_path, **read_kwargs)
         return self._adata
 
-    def _get_row(self, idx: int) -> np.ndarray:
+    def _get_row(self, idx: int, apply_transform: bool = True) -> np.ndarray:
         adata = self._ensure_adata()
         if self.layer is None:
             row = adata.X[idx]
@@ -656,7 +671,7 @@ class SingleCellVAEDataset(Dataset):
         x = x.astype(np.float32, copy=False)
         if self._gene_indices is not None:
             x = x[self._gene_indices]
-        if self.transform == "log1p":
+        if apply_transform and self.transform == "log1p":
             x = np.log1p(x)
         return x
 
@@ -664,12 +679,19 @@ class SingleCellVAEDataset(Dataset):
         return self.n_cells
 
     def __getitem__(self, idx: int):
-        x = torch.from_numpy(self._get_row(idx))
-        if self.cond_idx is not None:
-            c = torch.tensor(self.cond_idx[idx], dtype=torch.long)
-            return {"x_expr": x, "cond_idx": c}
-        else:
-            return {"x_expr": x}
+        x_raw = self._get_row(idx, apply_transform=False)
+        x = torch.from_numpy(
+            np.log1p(x_raw) if self.transform == "log1p" else x_raw
+        )
+        out = {
+            "x_expr": x,
+            "libsize": torch.tensor(float(x_raw.sum()), dtype=torch.float32),
+        }
+        if self.batch_idx is not None:
+            b = torch.tensor(self.batch_idx[idx], dtype=torch.long)
+            out["batch_idx"] = b
+            out["cond_idx"] = b
+        return out
 
     @property
     def adata(self):

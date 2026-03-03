@@ -96,6 +96,7 @@ def export_cbow_vae_cell_embeddings(
     gene_key: str = "gene",
     layer: str | None = None,
     cond_key: str | None = None,
+    batch_key: str | None = None,
     max_cells: int | None = None,
     batch_size: int = 64,
     num_workers: int = 4,
@@ -103,6 +104,11 @@ def export_cbow_vae_cell_embeddings(
     backed: bool = True,
 ) -> None:
     run_device = torch.device(device)
+    if batch_key is not None and cond_key is not None and batch_key != cond_key:
+        raise ValueError(
+            f"Both batch_key='{batch_key}' and cond_key='{cond_key}' were provided, but differ."
+        )
+    effective_batch_key = batch_key if batch_key is not None else cond_key
 
     ckpt_raw = torch.load(checkpoint_path, map_location="cpu")
     genes_common = ckpt_raw.get("genes_common", None)
@@ -113,13 +119,14 @@ def export_cbow_vae_cell_embeddings(
         adata_or_path=adata_path,
         gene_key=gene_key,
         layer=layer,
-        cond_key=cond_key,
+        cond_key=effective_batch_key,
+        batch_key=effective_batch_key,
         gene_order=genes_common,
         transform="none",
         backed=backed,
     )
 
-    n_conditions = len(ds.cond_categories) if ds.cond_categories is not None else None
+    n_conditions = len(ds.batch_categories) if ds.batch_categories is not None else None
     model, ckpt_raw = build_cbow_vae_from_checkpoint(
         checkpoint_path=checkpoint_path,
         n_genes=ds.n_genes,
@@ -150,11 +157,13 @@ def export_cbow_vae_cell_embeddings(
                 break
 
             x = batch["x_expr"].to(run_device, non_blocking=True)
-            cond_idx = batch.get("cond_idx", None)
-            if cond_idx is not None:
-                cond_idx = cond_idx.to(run_device, non_blocking=True)
+            batch_idx = batch.get("batch_idx", None)
+            if batch_idx is None:
+                batch_idx = batch.get("cond_idx", None)
+            if batch_idx is not None:
+                batch_idx = batch_idx.to(run_device, non_blocking=True)
 
-            mu_z, _ = model.encode(x, cond_idx)
+            mu_z, _ = model.encode(x, batch_idx)
 
             emb_np = mu_z.detach().cpu().numpy()
             bsz = emb_np.shape[0]
@@ -190,6 +199,7 @@ def main() -> None:
     parser.add_argument("--gene-key", default="gene", help="Gene column in adata.var (default: gene).")
     parser.add_argument("--layer", default=None, help="Expression layer in adata.layers (default: X).")
     parser.add_argument("--cond-key", default=None, help="Condition column in adata.obs.")
+    parser.add_argument("--batch-key", default=None, help="Batch column in adata.obs (preferred alias).")
     parser.add_argument(
         "--max-cells",
         type=int,
@@ -222,6 +232,7 @@ def main() -> None:
         gene_key=args.gene_key,
         layer=args.layer,
         cond_key=args.cond_key,
+        batch_key=args.batch_key,
         max_cells=args.max_cells,
         batch_size=args.batch_size,
         num_workers=args.num_workers,

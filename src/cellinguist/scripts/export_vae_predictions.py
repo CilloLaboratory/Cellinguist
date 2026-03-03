@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gzip
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -24,8 +25,17 @@ from cellinguist.utils.vae_io import (
 )
 
 
+def _resolve_batch_key(batch_key: Optional[str], cond_key: Optional[str]) -> Optional[str]:
+    if batch_key is not None and cond_key is not None and batch_key != cond_key:
+        raise ValueError(
+            f"Both batch_key='{batch_key}' and cond_key='{cond_key}' were provided, but differ."
+        )
+    return batch_key if batch_key is not None else cond_key
+
+
 def export_predictions(cfg: VAEExportConfig) -> None:
     device = torch.device(cfg.device)
+    effective_batch_key = _resolve_batch_key(cfg.batch_key, cfg.cond_key)
 
     # Read checkpoint raw for architecture + gene ordering metadata
     ckpt_raw = torch.load(cfg.checkpoint_path, map_location="cpu")
@@ -41,7 +51,8 @@ def export_predictions(cfg: VAEExportConfig) -> None:
         adata_or_path=cfg.adata_path,
         gene_key=cfg.gene_key,
         layer=cfg.layer,
-        cond_key=cfg.cond_key,
+        cond_key=effective_batch_key,
+        batch_key=effective_batch_key,
         gene_order=genes_common,
         transform="none",
         backed=True,
@@ -62,7 +73,7 @@ def export_predictions(cfg: VAEExportConfig) -> None:
             raise ValueError("Checkpoint genes and embedding genes are misaligned.")
 
     n_conditions = (
-        len(ds.cond_categories) if ds.cond_categories is not None else None
+        len(ds.batch_categories) if ds.batch_categories is not None else None
     )
 
     # Rebuild model with same architecture as training (use checkpoint config if present)
@@ -146,15 +157,21 @@ def export_predictions(cfg: VAEExportConfig) -> None:
                 break
 
             x = batch["x_expr"].to(device, non_blocking=True)
-            cond_idx = batch.get("cond_idx", None)
-            if cond_idx is not None:
-                cond_idx = cond_idx.to(device, non_blocking=True)
+            batch_idx = batch.get("batch_idx", None)
+            if batch_idx is None:
+                batch_idx = batch.get("cond_idx", None)
+            if batch_idx is not None:
+                batch_idx = batch_idx.to(device, non_blocking=True)
 
-            mu_z, logvar_z = model.encode(x, cond_idx)
+            mu_z, logvar_z = model.encode(x, batch_idx)
 
             # deterministic: z = mu_z
-            libsize = x.sum(dim=1) if use_library_size_covariate else None
-            mu, theta, pi = model.decoder(mu_z, cond_idx, libsize=libsize)
+            libsize = batch.get("libsize", None)
+            if libsize is not None:
+                libsize = libsize.to(device, non_blocking=True)
+            elif use_library_size_covariate:
+                libsize = x.sum(dim=1)
+            mu, theta, pi = model.decoder(mu_z, batch_idx, libsize=libsize)
 
             mu_np = mu.detach().cpu().numpy()
 

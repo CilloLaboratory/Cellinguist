@@ -81,6 +81,7 @@ class VAETrainConfig:
     gene_key: str = "gene"
     layer: Optional[str] = None
     cond_key: Optional[str] = None
+    batch_key: Optional[str] = None  # Preferred alias for nuisance batch covariate.
     backed: bool = True
 
     # Used only when encoder_type == "cbow".
@@ -117,6 +118,12 @@ class VAETrainConfig:
     runin_batches: int = 0
     runin_kl_weight: float = 0.0
     runin_metric_weight: float = 0.0
+    batch_invariance_method: str = "none"  # "none" or "adversarial"
+    batch_invariance_weight: float = 0.0
+    batch_adv_grl_lambda: float = 1.0
+    batch_adv_hidden_dim: int = 128
+    batch_adv_n_hidden_layers: int = 1
+    batch_invariance_warmup_epochs: int = 0
 
     lr: float = 3e-4
     weight_decay: float = 0.0
@@ -149,6 +156,7 @@ class VAEExportConfig:
     gene_key: str = "gene"
     layer: Optional[str] = None
     cond_key: Optional[str] = None
+    batch_key: Optional[str] = None
 
     # Used only when checkpoint/config indicates encoder_type == "cbow".
     gene_emb_tsv: str = ""

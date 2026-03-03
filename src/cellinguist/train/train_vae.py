@@ -6,8 +6,10 @@ import os
 import traceback
 from dataclasses import asdict
 from pathlib import Path
+from typing import Optional
 
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -19,6 +21,7 @@ from cellinguist.models.vae import (
     CBOWCellEncoder,
     PerceiverCellEncoder,
     ZINBExpressionDecoder,
+    BatchAdversary,
     GeneVAE,
     zinb_negative_log_likelihood,
     kl_divergence_normal,
@@ -95,6 +98,14 @@ def _log(rank: int, msg: str) -> None:
     print(f"[rank {rank}] {msg}", flush=True)
 
 
+def _resolve_batch_key(batch_key: Optional[str], cond_key: Optional[str]) -> Optional[str]:
+    if batch_key is not None and cond_key is not None and batch_key != cond_key:
+        raise ValueError(
+            f"Both batch_key='{batch_key}' and cond_key='{cond_key}' were provided, but differ."
+        )
+    return batch_key if batch_key is not None else cond_key
+
+
 def train_vae(cfg: VAETrainConfig) -> str:
     device, rank, world_size, is_ddp = _setup_distributed(cfg.device)
 
@@ -130,6 +141,20 @@ def train_vae(cfg: VAETrainConfig) -> str:
             raise ValueError("runin_kl_weight must be >= 0.")
         if cfg.runin_metric_weight < 0:
             raise ValueError("runin_metric_weight must be >= 0.")
+        if cfg.batch_invariance_method not in {"none", "adversarial"}:
+            raise ValueError("batch_invariance_method must be 'none' or 'adversarial'.")
+        if cfg.batch_invariance_weight < 0:
+            raise ValueError("batch_invariance_weight must be >= 0.")
+        if cfg.batch_adv_grl_lambda <= 0:
+            raise ValueError("batch_adv_grl_lambda must be > 0.")
+        if cfg.batch_adv_hidden_dim <= 0:
+            raise ValueError("batch_adv_hidden_dim must be > 0.")
+        if cfg.batch_adv_n_hidden_layers < 0:
+            raise ValueError("batch_adv_n_hidden_layers must be >= 0.")
+        if cfg.batch_invariance_warmup_epochs < 0:
+            raise ValueError("batch_invariance_warmup_epochs must be >= 0.")
+
+        effective_batch_key = _resolve_batch_key(cfg.batch_key, cfg.cond_key)
 
         if encoder_type == "cbow":
             if not cfg.gene_emb_tsv:
@@ -140,7 +165,8 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 adata_or_path=cfg.adata_path,
                 gene_key=cfg.gene_key,
                 layer=cfg.layer,
-                cond_key=cfg.cond_key,
+                cond_key=effective_batch_key,
+                batch_key=effective_batch_key,
                 transform="none",
                 backed=cfg.backed,
             )
@@ -155,7 +181,8 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 adata_or_path=cfg.adata_path,
                 gene_key=cfg.gene_key,
                 layer=cfg.layer,
-                cond_key=cfg.cond_key,
+                cond_key=effective_batch_key,
+                batch_key=effective_batch_key,
                 gene_order=genes_common,
                 transform="none",
                 backed=cfg.backed,
@@ -175,7 +202,8 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 adata_or_path=cfg.adata_path,
                 gene_key=cfg.gene_key,
                 layer=cfg.layer,
-                cond_key=cfg.cond_key,
+                cond_key=effective_batch_key,
+                batch_key=effective_batch_key,
                 transform="none",
                 backed=cfg.backed,
             )
@@ -188,7 +216,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
         _log(rank, f"dataset ready: n_cells={n_cells} n_genes={n_genes}")
 
         n_conditions = (
-            len(vae_dataset.cond_categories) if vae_dataset.cond_categories is not None else None
+            len(vae_dataset.batch_categories) if vae_dataset.batch_categories is not None else None
         )
 
         if encoder_type == "cbow":
@@ -232,7 +260,20 @@ def train_vae(cfg: VAETrainConfig) -> str:
             use_library_size_covariate=cfg.use_library_size_covariate,
             library_size_covariate_eps=cfg.library_size_covariate_eps,
         )
-        model: torch.nn.Module = GeneVAE(encoder, decoder).to(device)
+        batch_adversary = None
+        use_adv = cfg.batch_invariance_method == "adversarial"
+        if use_adv:
+            if n_conditions is None or n_conditions < 2:
+                raise ValueError(
+                    "Adversarial batch invariance requires a batch/cond key with at least 2 categories."
+                )
+            batch_adversary = BatchAdversary(
+                latent_dim=cfg.latent_dim,
+                n_batches=n_conditions,
+                hidden_dim=cfg.batch_adv_hidden_dim,
+                n_hidden_layers=cfg.batch_adv_n_hidden_layers,
+            )
+        model: torch.nn.Module = GeneVAE(encoder, decoder, batch_adversary=batch_adversary).to(device)
         _log(rank, "model built")
 
         if is_ddp:
@@ -366,12 +407,17 @@ def train_vae(cfg: VAETrainConfig) -> str:
                     break
 
                 x = batch["x_expr"].to(device, non_blocking=True)
-                libsize = x.sum(dim=1)
-                cond_idx = batch.get("cond_idx", None)
-                if cond_idx is not None:
-                    cond_idx = cond_idx.to(device, non_blocking=True)
+                libsize = batch.get("libsize", None)
+                if libsize is None:
+                    libsize = x.sum(dim=1)
+                libsize = libsize.to(device, non_blocking=True)
+                batch_idx = batch.get("batch_idx", None)
+                if batch_idx is None:
+                    batch_idx = batch.get("cond_idx", None)
+                if batch_idx is not None:
+                    batch_idx = batch_idx.to(device, non_blocking=True)
 
-                recon_out, mu_z, logvar_z = model(x, cond_idx, libsize=libsize)
+                recon_out, mu_z, logvar_z = model(x, batch_idx, libsize=libsize)
                 mu, theta, pi = recon_out
 
                 recon = zinb_negative_log_likelihood(x, mu, theta, pi, reduction="mean")
@@ -429,16 +475,22 @@ def train_vae(cfg: VAETrainConfig) -> str:
             total_recon = 0.0
             total_kl = 0.0
             total_metric = 0.0
+            total_adv = 0.0
             nb = 0
 
             for batch in dl:
                 x = batch["x_expr"].to(device, non_blocking=True)
-                libsize = x.sum(dim=1)
-                cond_idx = batch.get("cond_idx", None)
-                if cond_idx is not None:
-                    cond_idx = cond_idx.to(device, non_blocking=True)
+                libsize = batch.get("libsize", None)
+                if libsize is None:
+                    libsize = x.sum(dim=1)
+                libsize = libsize.to(device, non_blocking=True)
+                batch_idx = batch.get("batch_idx", None)
+                if batch_idx is None:
+                    batch_idx = batch.get("cond_idx", None)
+                if batch_idx is not None:
+                    batch_idx = batch_idx.to(device, non_blocking=True)
 
-                recon_out, mu_z, logvar_z = model(x, cond_idx, libsize=libsize)
+                recon_out, mu_z, logvar_z = model(x, batch_idx, libsize=libsize)
                 mu, theta, pi = recon_out
 
                 recon = zinb_negative_log_likelihood(x, mu, theta, pi, reduction="mean")
@@ -452,7 +504,23 @@ def train_vae(cfg: VAETrainConfig) -> str:
                         temperature=cfg.metric_temperature,
                         k_pos=cfg.metric_k_pos,
                     )
-                loss = recon + cfg.kl_weight * kl + cfg.metric_loss_weight * metric
+                adv = x.new_zeros(())
+                if (
+                    use_adv
+                    and cfg.batch_invariance_weight > 0
+                    and batch_idx is not None
+                    and epoch >= cfg.batch_invariance_warmup_epochs
+                ):
+                    logits = raw_model.predict_batch_logits(
+                        mu_z, grl_lambda=cfg.batch_adv_grl_lambda
+                    )
+                    adv = F.cross_entropy(logits, batch_idx)
+                loss = (
+                    recon
+                    + cfg.kl_weight * kl
+                    + cfg.metric_loss_weight * metric
+                    + cfg.batch_invariance_weight * adv
+                )
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -464,11 +532,12 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 total_recon += float(recon.item())
                 total_kl += float(kl.item())
                 total_metric += float(metric.item())
+                total_adv += float(adv.item())
                 nb += 1
 
             if is_ddp:
                 loss_stats = torch.tensor(
-                    [total, total_recon, total_kl, total_metric, float(nb)],
+                    [total, total_recon, total_kl, total_metric, total_adv, float(nb)],
                     device=device,
                 )
                 dist.all_reduce(loss_stats, op=dist.ReduceOp.SUM)
@@ -476,7 +545,8 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 total_recon = float(loss_stats[1].item())
                 total_kl = float(loss_stats[2].item())
                 total_metric = float(loss_stats[3].item())
-                nb = int(loss_stats[4].item())
+                total_adv = float(loss_stats[4].item())
+                nb = int(loss_stats[5].item())
 
             if is_main:
                 denom = max(nb, 1)
@@ -485,7 +555,8 @@ def train_vae(cfg: VAETrainConfig) -> str:
                     f"loss={total/denom:.4f} "
                     f"recon={total_recon/denom:.4f} "
                     f"kl={total_kl/denom:.4f} "
-                    f"metric={total_metric/denom:.4f}"
+                    f"metric={total_metric/denom:.4f} "
+                    f"adv={total_adv/denom:.4f}"
                 )
 
                 if cfg.save_every > 0 and ((epoch + 1) % cfg.save_every == 0):

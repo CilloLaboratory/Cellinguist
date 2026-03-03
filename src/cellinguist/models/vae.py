@@ -37,6 +37,46 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+class _GradientReversalFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, lambda_: float) -> torch.Tensor:
+        ctx.lambda_ = float(lambda_)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return -ctx.lambda_ * grad_output, None
+
+
+def gradient_reverse(x: torch.Tensor, lambda_: float = 1.0) -> torch.Tensor:
+    return _GradientReversalFn.apply(x, float(lambda_))
+
+
+class BatchAdversary(nn.Module):
+    """
+    Predict batch labels from latent z using a small MLP.
+    Used with gradient reversal so encoder learns batch-invariant features.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        n_batches: int,
+        hidden_dim: int = 128,
+        n_hidden_layers: int = 1,
+    ) -> None:
+        super().__init__()
+        self.classifier = MLP(
+            input_dim=int(latent_dim),
+            output_dim=int(n_batches),
+            hidden_dim=int(hidden_dim),
+            n_hidden_layers=int(n_hidden_layers),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.classifier(z)
+
+
 class FeedForward(nn.Module):
     def __init__(self, d_model: int, ff_mult: int = 4, dropout: float = 0.0) -> None:
         super().__init__()
@@ -468,10 +508,12 @@ class GeneVAE(nn.Module):
         self,
         encoder: nn.Module,
         decoder: nn.Module,
+        batch_adversary: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.batch_adversary = batch_adversary
 
     def encode(
         self,
@@ -514,6 +556,16 @@ class GeneVAE(nn.Module):
         z = self.reparameterize(mu, logvar)
         recon_x = self.decode(z, cond_idx, libsize=libsize)
         return recon_x, mu, logvar
+
+    def predict_batch_logits(
+        self,
+        z: torch.Tensor,
+        grl_lambda: float = 1.0,
+    ) -> torch.Tensor:
+        if self.batch_adversary is None:
+            raise RuntimeError("batch_adversary is not configured on this model.")
+        z_rev = gradient_reverse(z, lambda_=grl_lambda)
+        return self.batch_adversary(z_rev)
 
 # ---------------------------------------------------------------------------
 # ZINB decoder
