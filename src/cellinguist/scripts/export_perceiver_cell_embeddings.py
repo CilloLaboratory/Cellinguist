@@ -67,6 +67,8 @@ def build_perceiver_vae_from_checkpoint(
         n_hidden_layers=n_hidden_layers,
         n_conditions=n_conditions,
         cond_emb_dim=cond_emb_dim,
+        use_library_size_covariate=bool(train_cfg.get("use_library_size_covariate", False)),
+        library_size_covariate_eps=float(train_cfg.get("library_size_covariate_eps", 1e-8)),
     )
     model = GeneVAE(encoder, decoder).to(device)
     _ = load_vae_checkpoint(checkpoint_path, model, optimizer=None, map_location=device)

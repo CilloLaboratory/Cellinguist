@@ -22,6 +22,7 @@ from cellinguist.models.vae import (
     GeneVAE,
     zinb_negative_log_likelihood,
     kl_divergence_normal,
+    expression_triplet_metric_loss,
 )
 from cellinguist.utils.vae_io import (
     set_seed,
@@ -112,6 +113,17 @@ def train_vae(cfg: VAETrainConfig) -> str:
         if encoder_type not in {"cbow", "perceiver"}:
             raise ValueError(f"Unsupported encoder_type: {cfg.encoder_type}. Use 'cbow' or 'perceiver'.")
         _log(rank, f"encoder_type={encoder_type}")
+        if cfg.use_metric_loss:
+            if cfg.metric_loss_weight < 0:
+                raise ValueError("metric_loss_weight must be >= 0.")
+            if cfg.metric_margin < 0:
+                raise ValueError("metric_margin must be >= 0.")
+            if cfg.metric_k_pos < 1 or cfg.metric_k_neg < 1:
+                raise ValueError("metric_k_pos and metric_k_neg must be >= 1.")
+            if cfg.metric_expr_transform not in {"log1p", "none"}:
+                raise ValueError(
+                    f"Unsupported metric_expr_transform: {cfg.metric_expr_transform}"
+                )
 
         if encoder_type == "cbow":
             if not cfg.gene_emb_tsv:
@@ -148,6 +160,11 @@ def train_vae(cfg: VAETrainConfig) -> str:
             assert n_genes == emb.shape[0]
             gene_emb_source = cfg.gene_emb_tsv
         else:
+            if cfg.use_library_size_covariate and str(cfg.library_norm).lower() != "none" and is_main:
+                print(
+                    "[VAE] WARNING: use_library_size_covariate=True with library_norm!='none'. "
+                    "For a pure covariate strategy, set library_norm='none'."
+                )
             vae_dataset = SingleCellVAEDataset(
                 adata_or_path=cfg.adata_path,
                 gene_key=cfg.gene_key,
@@ -206,6 +223,8 @@ def train_vae(cfg: VAETrainConfig) -> str:
             n_hidden_layers=cfg.n_hidden_layers,
             n_conditions=n_conditions,
             cond_emb_dim=cfg.cond_emb_dim,
+            use_library_size_covariate=cfg.use_library_size_covariate,
+            library_size_covariate_eps=cfg.library_size_covariate_eps,
         )
         model: torch.nn.Module = GeneVAE(encoder, decoder).to(device)
         _log(rank, "model built")
@@ -326,20 +345,34 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 sampler.set_epoch(epoch)
 
             total = 0.0
+            total_recon = 0.0
+            total_kl = 0.0
+            total_metric = 0.0
             nb = 0
 
             for batch in dl:
                 x = batch["x_expr"].to(device, non_blocking=True)
+                libsize = x.sum(dim=1)
                 cond_idx = batch.get("cond_idx", None)
                 if cond_idx is not None:
                     cond_idx = cond_idx.to(device, non_blocking=True)
 
-                recon_out, mu_z, logvar_z = model(x, cond_idx)
+                recon_out, mu_z, logvar_z = model(x, cond_idx, libsize=libsize)
                 mu, theta, pi = recon_out
 
                 recon = zinb_negative_log_likelihood(x, mu, theta, pi, reduction="mean")
                 kl = kl_divergence_normal(mu_z, logvar_z, reduction="mean")
-                loss = recon + cfg.kl_weight * kl
+                metric = x.new_zeros(())
+                if cfg.use_metric_loss and cfg.metric_loss_weight > 0:
+                    metric = expression_triplet_metric_loss(
+                        x_expr=x,
+                        z_latent=mu_z,
+                        expr_transform=cfg.metric_expr_transform,
+                        margin=cfg.metric_margin,
+                        k_pos=cfg.metric_k_pos,
+                        k_neg=cfg.metric_k_neg,
+                    )
+                loss = recon + cfg.kl_weight * kl + cfg.metric_loss_weight * metric
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -348,16 +381,32 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 optimizer.step()
 
                 total += float(loss.item())
+                total_recon += float(recon.item())
+                total_kl += float(kl.item())
+                total_metric += float(metric.item())
                 nb += 1
 
             if is_ddp:
-                loss_stats = torch.tensor([total, float(nb)], device=device)
+                loss_stats = torch.tensor(
+                    [total, total_recon, total_kl, total_metric, float(nb)],
+                    device=device,
+                )
                 dist.all_reduce(loss_stats, op=dist.ReduceOp.SUM)
                 total = float(loss_stats[0].item())
-                nb = int(loss_stats[1].item())
+                total_recon = float(loss_stats[1].item())
+                total_kl = float(loss_stats[2].item())
+                total_metric = float(loss_stats[3].item())
+                nb = int(loss_stats[4].item())
 
             if is_main:
-                print(f"[VAE] Epoch {epoch+1}/{cfg.epochs} loss={total/max(nb, 1):.4f}")
+                denom = max(nb, 1)
+                print(
+                    f"[VAE] Epoch {epoch+1}/{cfg.epochs} "
+                    f"loss={total/denom:.4f} "
+                    f"recon={total_recon/denom:.4f} "
+                    f"kl={total_kl/denom:.4f} "
+                    f"metric={total_metric/denom:.4f}"
+                )
 
                 if cfg.save_every > 0 and ((epoch + 1) % cfg.save_every == 0):
                     save_vae_checkpoint(

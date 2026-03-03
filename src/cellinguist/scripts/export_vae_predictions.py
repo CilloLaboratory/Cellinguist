@@ -74,6 +74,8 @@ def export_predictions(cfg: VAEExportConfig) -> None:
     library_norm = str(train_cfg.get("library_norm", "size_factor"))
     library_norm_target_sum = float(train_cfg.get("library_norm_target_sum", 1e4))
     library_norm_eps = float(train_cfg.get("library_norm_eps", 1e-8))
+    use_library_size_covariate = bool(train_cfg.get("use_library_size_covariate", False))
+    library_size_covariate_eps = float(train_cfg.get("library_size_covariate_eps", 1e-8))
     freeze_gene_embeddings = bool(train_cfg.get("freeze_gene_embeddings", True))
 
     if encoder_type == "cbow":
@@ -114,6 +116,8 @@ def export_predictions(cfg: VAEExportConfig) -> None:
         n_hidden_layers=n_hidden_layers,
         n_conditions=n_conditions,
         cond_emb_dim=cond_emb_dim,
+        use_library_size_covariate=use_library_size_covariate,
+        library_size_covariate_eps=library_size_covariate_eps,
     )
     model = GeneVAE(encoder, decoder).to(device)
 
@@ -149,7 +153,8 @@ def export_predictions(cfg: VAEExportConfig) -> None:
             mu_z, logvar_z = model.encode(x, cond_idx)
 
             # deterministic: z = mu_z
-            mu, theta, pi = model.decoder(mu_z, cond_idx)
+            libsize = x.sum(dim=1) if use_library_size_covariate else None
+            mu, theta, pi = model.decoder(mu_z, cond_idx, libsize=libsize)
 
             mu_np = mu.detach().cpu().numpy()
 

@@ -493,13 +493,15 @@ class GeneVAE(nn.Module):
         self,
         z: torch.Tensor,
         cond_idx: Optional[torch.Tensor] = None,
+        libsize: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.decoder(z, cond_idx)
+        return self.decoder(z, cond_idx, libsize=libsize)
 
     def forward(
         self,
         x_expr: torch.Tensor,
         cond_idx: Optional[torch.Tensor] = None,
+        libsize: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns
@@ -510,7 +512,7 @@ class GeneVAE(nn.Module):
         """
         mu, logvar = self.encode(x_expr, cond_idx)
         z = self.reparameterize(mu, logvar)
-        recon_x = self.decode(z, cond_idx)
+        recon_x = self.decode(z, cond_idx, libsize=libsize)
         return recon_x, mu, logvar
 
 # ---------------------------------------------------------------------------
@@ -537,9 +539,15 @@ class ZINBExpressionDecoder(nn.Module):
         n_hidden_layers: int,
         n_conditions: Optional[int] = None,
         cond_emb_dim: int = 16,
+        use_library_size_covariate: bool = False,
+        library_size_covariate_eps: float = 1e-8,
     ) -> None:
         super().__init__()
         self.n_genes = n_genes
+        self.use_library_size_covariate = bool(use_library_size_covariate)
+        self.library_size_covariate_eps = float(library_size_covariate_eps)
+        if self.library_size_covariate_eps <= 0:
+            raise ValueError("library_size_covariate_eps must be > 0.")
 
         # Optional condition embedding
         if n_conditions is not None:
@@ -549,7 +557,7 @@ class ZINBExpressionDecoder(nn.Module):
             self.cond_embedding = None
             cond_input_dim = 0
 
-        decoder_input_dim = latent_dim + cond_input_dim
+        decoder_input_dim = latent_dim + cond_input_dim + (1 if self.use_library_size_covariate else 0)
 
         # MLP for mu (pre-activation)
         self.mlp_mu = MLP(
@@ -575,6 +583,7 @@ class ZINBExpressionDecoder(nn.Module):
         self,
         z: torch.Tensor,
         cond_idx: Optional[torch.Tensor] = None,
+        libsize: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Parameters
@@ -593,6 +602,16 @@ class ZINBExpressionDecoder(nn.Module):
             h_in = torch.cat([z, c], dim=-1)
         else:
             h_in = z
+
+        if self.use_library_size_covariate:
+            if libsize is None:
+                raise ValueError("libsize must be provided when use_library_size_covariate=True.")
+            if libsize.ndim == 1:
+                libsize = libsize.unsqueeze(-1)
+            elif libsize.ndim != 2 or libsize.shape[1] != 1:
+                raise ValueError("libsize must have shape (B,) or (B, 1).")
+            libsize_feat = torch.log1p(libsize.to(dtype=z.dtype, device=z.device).clamp_min(0.0))
+            h_in = torch.cat([h_in, libsize_feat], dim=-1)
 
         mu_logit = self.mlp_mu(h_in)   # (B, G)
         pi_logit = self.mlp_pi(h_in)   # (B, G)
@@ -721,3 +740,56 @@ def zinb_negative_log_likelihood(
         return nll
     else:
         raise ValueError(f"Unsupported reduction: {reduction}")
+
+
+def expression_triplet_metric_loss(
+    x_expr: torch.Tensor,
+    z_latent: torch.Tensor,
+    expr_transform: str = "log1p",
+    margin: float = 0.2,
+    k_pos: int = 5,
+    k_neg: int = 20,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Batch-wise triplet metric loss.
+
+    Positives are selected as nearest neighbors in expression-profile space,
+    negatives as least similar cells in the same batch. Triplets are then
+    enforced in latent space.
+    """
+    bsz = int(x_expr.shape[0])
+    if bsz < 3:
+        return z_latent.new_zeros(())
+
+    if expr_transform == "log1p":
+        x_feat = torch.log1p(x_expr.clamp_min(0.0))
+    elif expr_transform == "none":
+        x_feat = x_expr
+    else:
+        raise ValueError(f"Unsupported expr_transform: {expr_transform}")
+
+    x_norm = F.normalize(x_feat, p=2, dim=1, eps=eps)
+    expr_sim = x_norm @ x_norm.t()  # (B, B), cosine similarity
+
+    # Exclude self-comparisons
+    eye_mask = torch.eye(bsz, device=expr_sim.device, dtype=torch.bool)
+    expr_sim_pos = expr_sim.masked_fill(eye_mask, float("-inf"))
+    expr_sim_neg = expr_sim.masked_fill(eye_mask, float("inf"))
+
+    k_pos_eff = max(1, min(int(k_pos), bsz - 1))
+    k_neg_eff = max(1, min(int(k_neg), bsz - 1))
+
+    pos_idx = torch.topk(expr_sim_pos, k=k_pos_eff, dim=1, largest=True).indices
+    neg_idx = torch.topk(expr_sim_neg, k=k_neg_eff, dim=1, largest=False).indices
+
+    d_lat = torch.cdist(z_latent, z_latent, p=2)  # (B, B)
+    d_pos_cand = torch.gather(d_lat, dim=1, index=pos_idx)  # (B, k_pos_eff)
+    d_neg_cand = torch.gather(d_lat, dim=1, index=neg_idx)  # (B, k_neg_eff)
+
+    # Hard-positive / hard-negative within candidate sets
+    d_pos = d_pos_cand.max(dim=1).values
+    d_neg = d_neg_cand.min(dim=1).values
+
+    loss = F.relu(d_pos - d_neg + float(margin))
+    return loss.mean()

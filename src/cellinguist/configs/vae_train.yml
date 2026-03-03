@@ -17,6 +17,8 @@ input_transform: "log1p"
 library_norm: "size_factor"
 library_norm_target_sum: 10000.0
 library_norm_eps: 1.0e-8
+use_library_size_covariate: false
+library_size_covariate_eps: 1.0e-8
 freeze_gene_embeddings: true
 perceiver_d_model: 256
 perceiver_num_latents: 64
@@ -28,6 +30,12 @@ perceiver_dropout: 0.0
 
 # loss
 kl_weight: 1.0
+use_metric_loss: false
+metric_loss_weight: 0.1
+metric_expr_transform: "log1p"
+metric_margin: 0.2
+metric_k_pos: 5
+metric_k_neg: 20
 
 # training
 lr: 0.0003

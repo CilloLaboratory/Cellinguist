@@ -94,6 +94,8 @@ class VAETrainConfig:
     library_norm: str = "size_factor"  # "size_factor" or "none" (Perceiver encoder)
     library_norm_target_sum: float = 1e4
     library_norm_eps: float = 1e-8
+    use_library_size_covariate: bool = False  # Decoder-side log1p(library_size) covariate
+    library_size_covariate_eps: float = 1e-8
     freeze_gene_embeddings: bool = True
     perceiver_d_model: int = 256
     perceiver_num_latents: int = 64
@@ -104,6 +106,12 @@ class VAETrainConfig:
     perceiver_dropout: float = 0.0
 
     kl_weight: float = 1.0
+    use_metric_loss: bool = False
+    metric_loss_weight: float = 0.1
+    metric_expr_transform: str = "log1p"  # "log1p" or "none"
+    metric_margin: float = 0.2
+    metric_k_pos: int = 5
+    metric_k_neg: int = 20
 
     lr: float = 3e-4
     weight_decay: float = 0.0
