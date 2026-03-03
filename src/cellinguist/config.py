@@ -110,9 +110,10 @@ class VAETrainConfig:
     use_metric_loss: bool = False
     metric_loss_weight: float = 0.1
     metric_expr_transform: str = "log1p"  # "log1p" or "none"
-    metric_margin: float = 0.2
+    metric_margin: float = 0.2  # deprecated for contrastive loss, kept for backward compatibility
+    metric_temperature: float = 0.1
     metric_k_pos: int = 5
-    metric_k_neg: int = 20
+    metric_k_neg: int = 20  # deprecated for contrastive loss, kept for backward compatibility
 
     lr: float = 3e-4
     weight_decay: float = 0.0

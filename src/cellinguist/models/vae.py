@@ -742,25 +742,26 @@ def zinb_negative_log_likelihood(
         raise ValueError(f"Unsupported reduction: {reduction}")
 
 
-def expression_triplet_metric_loss(
+def expression_contrastive_metric_loss(
     x_expr: torch.Tensor,
     z_latent: torch.Tensor,
     expr_transform: str = "log1p",
-    margin: float = 0.2,
+    temperature: float = 0.1,
     k_pos: int = 5,
-    k_neg: int = 20,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """
-    Batch-wise triplet metric loss.
+    Batch-wise contrastive metric loss (InfoNCE-style).
 
-    Positives are selected as nearest neighbors in expression-profile space,
-    negatives as least similar cells in the same batch. Triplets are then
-    enforced in latent space.
+    For each anchor, positives are selected as top-k nearest neighbors in
+    expression-profile space. All non-self cells in the batch act as
+    denominator candidates in latent space.
     """
     bsz = int(x_expr.shape[0])
     if bsz < 3:
         return z_latent.new_zeros(())
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0.")
 
     if expr_transform == "log1p":
         x_feat = torch.log1p(x_expr.clamp_min(0.0))
@@ -770,26 +771,29 @@ def expression_triplet_metric_loss(
         raise ValueError(f"Unsupported expr_transform: {expr_transform}")
 
     x_norm = F.normalize(x_feat, p=2, dim=1, eps=eps)
-    expr_sim = x_norm @ x_norm.t()  # (B, B), cosine similarity
-
-    # Exclude self-comparisons
+    expr_sim = x_norm @ x_norm.t()  # (B, B)
     eye_mask = torch.eye(bsz, device=expr_sim.device, dtype=torch.bool)
+
+    # Build a binary positive mask from expression nearest neighbors.
     expr_sim_pos = expr_sim.masked_fill(eye_mask, float("-inf"))
-    expr_sim_neg = expr_sim.masked_fill(eye_mask, float("inf"))
-
     k_pos_eff = max(1, min(int(k_pos), bsz - 1))
-    k_neg_eff = max(1, min(int(k_neg), bsz - 1))
-
     pos_idx = torch.topk(expr_sim_pos, k=k_pos_eff, dim=1, largest=True).indices
-    neg_idx = torch.topk(expr_sim_neg, k=k_neg_eff, dim=1, largest=False).indices
+    pos_mask = torch.zeros((bsz, bsz), device=expr_sim.device, dtype=torch.bool)
+    pos_mask.scatter_(1, pos_idx, True)
+    pos_mask = pos_mask | pos_mask.t()
+    pos_mask = pos_mask & (~eye_mask)
 
-    d_lat = torch.cdist(z_latent, z_latent, p=2)  # (B, B)
-    d_pos_cand = torch.gather(d_lat, dim=1, index=pos_idx)  # (B, k_pos_eff)
-    d_neg_cand = torch.gather(d_lat, dim=1, index=neg_idx)  # (B, k_neg_eff)
+    # Contrastive logits in latent space.
+    z_norm = F.normalize(z_latent, p=2, dim=1, eps=eps)
+    logits = (z_norm @ z_norm.t()) / float(temperature)  # (B, B)
+    logits = logits.masked_fill(eye_mask, float("-inf"))
+    log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
 
-    # Hard-positive / hard-negative within candidate sets
-    d_pos = d_pos_cand.max(dim=1).values
-    d_neg = d_neg_cand.min(dim=1).values
+    pos_counts = pos_mask.sum(dim=1)
+    valid = pos_counts > 0
+    if not bool(valid.any()):
+        return z_latent.new_zeros(())
 
-    loss = F.relu(d_pos - d_neg + float(margin))
-    return loss.mean()
+    pos_log_prob_sum = (log_prob.masked_fill(~pos_mask, 0.0)).sum(dim=1)
+    loss_i = -pos_log_prob_sum[valid] / pos_counts[valid].to(log_prob.dtype)
+    return loss_i.mean()

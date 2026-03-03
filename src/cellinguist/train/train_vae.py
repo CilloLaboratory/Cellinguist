@@ -22,7 +22,7 @@ from cellinguist.models.vae import (
     GeneVAE,
     zinb_negative_log_likelihood,
     kl_divergence_normal,
-    expression_triplet_metric_loss,
+    expression_contrastive_metric_loss,
 )
 from cellinguist.utils.vae_io import (
     set_seed,
@@ -116,10 +116,10 @@ def train_vae(cfg: VAETrainConfig) -> str:
         if cfg.use_metric_loss:
             if cfg.metric_loss_weight < 0:
                 raise ValueError("metric_loss_weight must be >= 0.")
-            if cfg.metric_margin < 0:
-                raise ValueError("metric_margin must be >= 0.")
-            if cfg.metric_k_pos < 1 or cfg.metric_k_neg < 1:
-                raise ValueError("metric_k_pos and metric_k_neg must be >= 1.")
+            if cfg.metric_temperature <= 0:
+                raise ValueError("metric_temperature must be > 0.")
+            if cfg.metric_k_pos < 1:
+                raise ValueError("metric_k_pos must be >= 1.")
             if cfg.metric_expr_transform not in {"log1p", "none"}:
                 raise ValueError(
                     f"Unsupported metric_expr_transform: {cfg.metric_expr_transform}"
@@ -364,13 +364,12 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 kl = kl_divergence_normal(mu_z, logvar_z, reduction="mean")
                 metric = x.new_zeros(())
                 if cfg.use_metric_loss and cfg.metric_loss_weight > 0:
-                    metric = expression_triplet_metric_loss(
+                    metric = expression_contrastive_metric_loss(
                         x_expr=x,
                         z_latent=mu_z,
                         expr_transform=cfg.metric_expr_transform,
-                        margin=cfg.metric_margin,
+                        temperature=cfg.metric_temperature,
                         k_pos=cfg.metric_k_pos,
-                        k_neg=cfg.metric_k_neg,
                     )
                 loss = recon + cfg.kl_weight * kl + cfg.metric_loss_weight * metric
 
