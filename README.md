@@ -31,3 +31,9 @@ Perceiver-native embedding exports from VAE checkpoints:
 export-perceiver-cell-embeddings --adata /path/to/data.h5ad --checkpoint /path/to/vae_last.ckpt --out /path/to/perceiver_cell_embeddings.tsv.gz
 export-perceiver-gene-embeddings --checkpoint /path/to/vae_last.ckpt --out /path/to/perceiver_gene_embeddings.tsv.gz
 ```
+
+CBOW/MLP VAE cell embedding export:
+
+```
+export-cbow-vae-cell-embeddings --adata /path/to/data.h5ad --checkpoint /path/to/vae_last.ckpt --gene-emb-tsv /path/to/gene_embeddings.tsv.gz --out /path/to/cbow_vae_cell_embeddings.tsv.gz
+```
