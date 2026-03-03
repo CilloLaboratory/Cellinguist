@@ -81,6 +81,7 @@ class VAETrainConfig:
     gene_key: str = "gene"
     layer: Optional[str] = None
     cond_key: Optional[str] = None
+    backed: bool = True
 
     # Used only when encoder_type == "cbow".
     gene_emb_tsv: str = ""

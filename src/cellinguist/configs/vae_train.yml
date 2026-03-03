@@ -2,6 +2,7 @@ adata_path: "/home/arc85/Desktop/Cellinguist/cytokine_dict_ser_sub_full_genes_ad
 gene_key: "gene"
 layer: null
 cond_key: null
+backed: true
 
 # encoder backbone: "perceiver" (default) or "cbow"
 encoder_type: "perceiver"

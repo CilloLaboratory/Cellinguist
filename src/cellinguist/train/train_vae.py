@@ -136,7 +136,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 layer=cfg.layer,
                 cond_key=cfg.cond_key,
                 transform="none",
-                backed=True,
+                backed=cfg.backed,
             )
             genes_expr = ds_probe.gene_order
             if is_main:
@@ -152,7 +152,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 cond_key=cfg.cond_key,
                 gene_order=genes_common,
                 transform="none",
-                backed=True,
+                backed=cfg.backed,
             )
             n_cells, n_genes = vae_dataset.n_cells, vae_dataset.n_genes
             if is_main:
@@ -171,7 +171,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 layer=cfg.layer,
                 cond_key=cfg.cond_key,
                 transform="none",
-                backed=True,
+                backed=cfg.backed,
             )
             genes_common = vae_dataset.gene_order
             n_cells, n_genes = vae_dataset.n_cells, vae_dataset.n_genes
