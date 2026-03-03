@@ -114,6 +114,9 @@ class VAETrainConfig:
     metric_temperature: float = 0.1
     metric_k_pos: int = 5
     metric_k_neg: int = 20  # deprecated for contrastive loss, kept for backward compatibility
+    runin_batches: int = 0
+    runin_kl_weight: float = 0.0
+    runin_metric_weight: float = 0.0
 
     lr: float = 3e-4
     weight_decay: float = 0.0

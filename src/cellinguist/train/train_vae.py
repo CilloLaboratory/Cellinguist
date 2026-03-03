@@ -124,6 +124,12 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 raise ValueError(
                     f"Unsupported metric_expr_transform: {cfg.metric_expr_transform}"
                 )
+        if cfg.runin_batches < 0:
+            raise ValueError("runin_batches must be >= 0.")
+        if cfg.runin_kl_weight < 0:
+            raise ValueError("runin_kl_weight must be >= 0.")
+        if cfg.runin_metric_weight < 0:
+            raise ValueError("runin_metric_weight must be >= 0.")
 
         if encoder_type == "cbow":
             if not cfg.gene_emb_tsv:
@@ -340,6 +346,81 @@ def train_vae(cfg: VAETrainConfig) -> str:
 
         model.train()
         _log(rank, f"training loop start: epochs={cfg.epochs} start_epoch={start_epoch}")
+
+        if start_epoch == 0 and cfg.runin_batches > 0:
+            if sampler is not None:
+                sampler.set_epoch(0)
+            runin_total = 0.0
+            runin_recon = 0.0
+            runin_kl = 0.0
+            runin_metric = 0.0
+            runin_nb = 0
+            max_runin_batches = min(int(cfg.runin_batches), len(dl))
+            _log(
+                rank,
+                f"run-in start: batches={max_runin_batches} kl_w={cfg.runin_kl_weight} "
+                f"metric_w={cfg.runin_metric_weight}",
+            )
+            for batch in dl:
+                if runin_nb >= max_runin_batches:
+                    break
+
+                x = batch["x_expr"].to(device, non_blocking=True)
+                libsize = x.sum(dim=1)
+                cond_idx = batch.get("cond_idx", None)
+                if cond_idx is not None:
+                    cond_idx = cond_idx.to(device, non_blocking=True)
+
+                recon_out, mu_z, logvar_z = model(x, cond_idx, libsize=libsize)
+                mu, theta, pi = recon_out
+
+                recon = zinb_negative_log_likelihood(x, mu, theta, pi, reduction="mean")
+                kl = kl_divergence_normal(mu_z, logvar_z, reduction="mean")
+                metric = x.new_zeros(())
+                if cfg.use_metric_loss and cfg.runin_metric_weight > 0:
+                    metric = expression_contrastive_metric_loss(
+                        x_expr=x,
+                        z_latent=mu_z,
+                        expr_transform=cfg.metric_expr_transform,
+                        temperature=cfg.metric_temperature,
+                        k_pos=cfg.metric_k_pos,
+                    )
+                loss = recon + cfg.runin_kl_weight * kl + cfg.runin_metric_weight * metric
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if cfg.grad_clip_norm and cfg.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
+                optimizer.step()
+
+                runin_total += float(loss.item())
+                runin_recon += float(recon.item())
+                runin_kl += float(kl.item())
+                runin_metric += float(metric.item())
+                runin_nb += 1
+
+            if is_ddp:
+                runin_stats = torch.tensor(
+                    [runin_total, runin_recon, runin_kl, runin_metric, float(runin_nb)],
+                    device=device,
+                )
+                dist.all_reduce(runin_stats, op=dist.ReduceOp.SUM)
+                runin_total = float(runin_stats[0].item())
+                runin_recon = float(runin_stats[1].item())
+                runin_kl = float(runin_stats[2].item())
+                runin_metric = float(runin_stats[3].item())
+                runin_nb = int(runin_stats[4].item())
+
+            if is_main and runin_nb > 0:
+                denom = max(runin_nb, 1)
+                print(
+                    f"[VAE] Run-in ({runin_nb} batches) "
+                    f"loss={runin_total/denom:.4f} "
+                    f"recon={runin_recon/denom:.4f} "
+                    f"kl={runin_kl/denom:.4f} "
+                    f"metric={runin_metric/denom:.4f}"
+                )
+
         for epoch in range(start_epoch, cfg.epochs):
             if sampler is not None:
                 sampler.set_epoch(epoch)

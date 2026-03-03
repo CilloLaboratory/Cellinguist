@@ -38,6 +38,9 @@ metric_margin: 0.2
 metric_temperature: 0.1
 metric_k_pos: 5
 metric_k_neg: 20
+runin_batches: 0
+runin_kl_weight: 0.0
+runin_metric_weight: 0.0
 
 # training
 lr: 0.0003
