@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
 from cellinguist.config import VAETrainConfig, load_yaml
@@ -38,6 +38,7 @@ from cellinguist.utils.vae_io import (
     inv_softplus,
     logit,
 )
+from cellinguist.utils.perturbation_split import build_cytokine_combo_split
 
 
 def _is_distributed() -> bool:
@@ -153,8 +154,22 @@ def train_vae(cfg: VAETrainConfig) -> str:
             raise ValueError("batch_adv_n_hidden_layers must be >= 0.")
         if cfg.batch_invariance_warmup_epochs < 0:
             raise ValueError("batch_invariance_warmup_epochs must be >= 0.")
+        if cfg.perturbation_mode not in {"none", "categorical", "cytokine_vector"}:
+            raise ValueError("perturbation_mode must be one of: none, categorical, cytokine_vector.")
+        if cfg.cytokine_transform not in {"none", "log1p", "zscore"}:
+            raise ValueError("cytokine_transform must be one of: none, log1p, zscore.")
+        if cfg.cytokine_missing_policy not in {"error", "fill_zero"}:
+            raise ValueError("cytokine_missing_policy must be one of: error, fill_zero.")
+        if cfg.perturb_emb_dim <= 0:
+            raise ValueError("perturb_emb_dim must be > 0.")
+        if cfg.cytokine_holdout_min_active < 2:
+            raise ValueError("cytokine_holdout_min_active must be >= 2.")
 
         effective_batch_key = _resolve_batch_key(cfg.batch_key, cfg.cond_key)
+        if cfg.perturbation_mode == "categorical" and effective_batch_key is None:
+            raise ValueError(
+                "perturbation_mode='categorical' requires batch_key/cond_key."
+            )
 
         if encoder_type == "cbow":
             if not cfg.gene_emb_tsv:
@@ -167,6 +182,10 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 layer=cfg.layer,
                 cond_key=effective_batch_key,
                 batch_key=effective_batch_key,
+                perturbation_mode=cfg.perturbation_mode,
+                cytokine_keys=cfg.cytokine_keys,
+                cytokine_transform=cfg.cytokine_transform,
+                cytokine_missing_policy=cfg.cytokine_missing_policy,
                 transform="none",
                 backed=cfg.backed,
             )
@@ -183,6 +202,10 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 layer=cfg.layer,
                 cond_key=effective_batch_key,
                 batch_key=effective_batch_key,
+                perturbation_mode=cfg.perturbation_mode,
+                cytokine_keys=cfg.cytokine_keys,
+                cytokine_transform=cfg.cytokine_transform,
+                cytokine_missing_policy=cfg.cytokine_missing_policy,
                 gene_order=genes_common,
                 transform="none",
                 backed=cfg.backed,
@@ -204,6 +227,10 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 layer=cfg.layer,
                 cond_key=effective_batch_key,
                 batch_key=effective_batch_key,
+                perturbation_mode=cfg.perturbation_mode,
+                cytokine_keys=cfg.cytokine_keys,
+                cytokine_transform=cfg.cytokine_transform,
+                cytokine_missing_policy=cfg.cytokine_missing_policy,
                 transform="none",
                 backed=cfg.backed,
             )
@@ -218,6 +245,17 @@ def train_vae(cfg: VAETrainConfig) -> str:
         n_conditions = (
             len(vae_dataset.batch_categories) if vae_dataset.batch_categories is not None else None
         )
+        perturbation_dim = (
+            int(vae_dataset.n_perturb_features) if cfg.perturbation_mode == "cytokine_vector" else None
+        )
+        if cfg.perturbation_mode == "cytokine_vector" and (perturbation_dim is None or perturbation_dim <= 0):
+            raise ValueError("cytokine_vector mode requires non-empty cytokine_keys.")
+        if is_main:
+            print(
+                f"[VAE] perturbation_mode={cfg.perturbation_mode} "
+                f"n_perturb_features={perturbation_dim or 0} "
+                f"cytokine_keys={vae_dataset.cytokine_keys if hasattr(vae_dataset, 'cytokine_keys') else []}"
+            )
 
         if encoder_type == "cbow":
             encoder = CBOWCellEncoder(
@@ -227,6 +265,8 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 n_hidden_layers=cfg.n_hidden_layers,
                 n_conditions=n_conditions,
                 cond_emb_dim=cfg.cond_emb_dim,
+                perturbation_dim=perturbation_dim,
+                perturb_emb_dim=cfg.perturb_emb_dim,
                 freeze_gene_embeddings=cfg.freeze_gene_embeddings,
                 input_transform=cfg.input_transform,
             )
@@ -238,6 +278,8 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 n_hidden_layers=cfg.n_hidden_layers,
                 n_conditions=n_conditions,
                 cond_emb_dim=cfg.cond_emb_dim,
+                perturbation_dim=perturbation_dim,
+                perturb_emb_dim=cfg.perturb_emb_dim,
                 input_transform=cfg.input_transform,
                 library_norm=cfg.library_norm,
                 library_norm_target_sum=cfg.library_norm_target_sum,
@@ -257,6 +299,8 @@ def train_vae(cfg: VAETrainConfig) -> str:
             n_hidden_layers=cfg.n_hidden_layers,
             n_conditions=n_conditions,
             cond_emb_dim=cfg.cond_emb_dim,
+            perturbation_dim=perturbation_dim,
+            perturb_emb_dim=cfg.perturb_emb_dim,
             use_library_size_covariate=cfg.use_library_size_covariate,
             library_size_covariate_eps=cfg.library_size_covariate_eps,
         )
@@ -290,7 +334,13 @@ def train_vae(cfg: VAETrainConfig) -> str:
 
         start_epoch = 0
         if cfg.resume_from:
-            ckpt = load_vae_checkpoint(cfg.resume_from, raw_model, optimizer, map_location=device)
+            ckpt = load_vae_checkpoint(
+                cfg.resume_from,
+                raw_model,
+                optimizer,
+                map_location=device,
+                strict=True,
+            )
             start_epoch = int(ckpt.get("epoch", -1)) + 1
 
             ckpt_genes = ckpt.get("genes_common", None)
@@ -298,10 +348,29 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 raise ValueError("genes_common mismatch between checkpoint and current data/embeddings.")
         _log(rank, f"checkpoint state ready: start_epoch={start_epoch}")
 
+        train_dataset = vae_dataset
+        val_dataset = None
+        if cfg.perturbation_mode == "cytokine_vector":
+            split = build_cytokine_combo_split(
+                perturb_matrix=vae_dataset.get_perturb_matrix(),
+                cytokine_keys=vae_dataset.cytokine_keys,
+                min_active_for_holdout=cfg.cytokine_holdout_min_active,
+            )
+            if split["val_indices"]:
+                train_dataset = Subset(vae_dataset, split["train_indices"])
+                val_dataset = Subset(vae_dataset, split["val_indices"])
+            if is_main:
+                print(
+                    "[VAE] cytokine split summary: "
+                    f"train_cells={split['n_train_cells']} val_cells={split['n_val_cells']} "
+                    f"n_train_signatures={split['n_train_signatures']} "
+                    f"n_val_signatures={split['n_val_signatures']}"
+                )
+
         sampler = None
         if is_ddp:
             sampler = DistributedSampler(
-                vae_dataset,
+                train_dataset,
                 num_replicas=world_size,
                 rank=rank,
                 shuffle=True,
@@ -314,7 +383,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
             effective_num_workers = 0
 
         dl = DataLoader(
-            vae_dataset,
+            train_dataset,
             batch_size=cfg.batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
@@ -323,6 +392,17 @@ def train_vae(cfg: VAETrainConfig) -> str:
             persistent_workers=effective_num_workers > 0,
         )
         _log(rank, f"dataloader ready: batch_size={cfg.batch_size} num_workers={effective_num_workers}")
+
+        val_dl = None
+        if val_dataset is not None:
+            val_dl = DataLoader(
+                val_dataset,
+                batch_size=cfg.batch_size,
+                shuffle=False,
+                num_workers=effective_num_workers,
+                pin_memory=(device.type == "cuda"),
+                persistent_workers=effective_num_workers > 0,
+            )
 
         ckpt_dir = Path(cfg.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -416,8 +496,16 @@ def train_vae(cfg: VAETrainConfig) -> str:
                     batch_idx = batch.get("cond_idx", None)
                 if batch_idx is not None:
                     batch_idx = batch_idx.to(device, non_blocking=True)
+                perturb_vec = batch.get("perturb_vec", None)
+                if perturb_vec is not None:
+                    perturb_vec = perturb_vec.to(device, non_blocking=True)
 
-                recon_out, mu_z, logvar_z = model(x, batch_idx, libsize=libsize)
+                recon_out, mu_z, logvar_z = model(
+                    x,
+                    batch_idx,
+                    libsize=libsize,
+                    perturb_vec=perturb_vec,
+                )
                 mu, theta, pi = recon_out
 
                 recon = zinb_negative_log_likelihood(x, mu, theta, pi, reduction="mean")
@@ -489,8 +577,16 @@ def train_vae(cfg: VAETrainConfig) -> str:
                     batch_idx = batch.get("cond_idx", None)
                 if batch_idx is not None:
                     batch_idx = batch_idx.to(device, non_blocking=True)
+                perturb_vec = batch.get("perturb_vec", None)
+                if perturb_vec is not None:
+                    perturb_vec = perturb_vec.to(device, non_blocking=True)
 
-                recon_out, mu_z, logvar_z = model(x, batch_idx, libsize=libsize)
+                recon_out, mu_z, logvar_z = model(
+                    x,
+                    batch_idx,
+                    libsize=libsize,
+                    perturb_vec=perturb_vec,
+                )
                 mu, theta, pi = recon_out
 
                 recon = zinb_negative_log_likelihood(x, mu, theta, pi, reduction="mean")
@@ -548,8 +644,49 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 total_adv = float(loss_stats[4].item())
                 nb = int(loss_stats[5].item())
 
+            val_recon = 0.0
+            val_nb = 0
+            if val_dl is not None:
+                model.eval()
+                with torch.no_grad():
+                    for batch in val_dl:
+                        x = batch["x_expr"].to(device, non_blocking=True)
+                        libsize = batch.get("libsize", None)
+                        if libsize is None:
+                            libsize = x.sum(dim=1)
+                        libsize = libsize.to(device, non_blocking=True)
+                        batch_idx = batch.get("batch_idx", None)
+                        if batch_idx is None:
+                            batch_idx = batch.get("cond_idx", None)
+                        if batch_idx is not None:
+                            batch_idx = batch_idx.to(device, non_blocking=True)
+                        perturb_vec = batch.get("perturb_vec", None)
+                        if perturb_vec is not None:
+                            perturb_vec = perturb_vec.to(device, non_blocking=True)
+
+                        recon_out, _, _ = model(
+                            x,
+                            batch_idx,
+                            libsize=libsize,
+                            perturb_vec=perturb_vec,
+                        )
+                        mu, theta, pi = recon_out
+                        recon = zinb_negative_log_likelihood(x, mu, theta, pi, reduction="mean")
+                        val_recon += float(recon.item())
+                        val_nb += 1
+                model.train()
+
+            if is_ddp and val_dl is not None:
+                val_stats = torch.tensor([val_recon, float(val_nb)], device=device)
+                dist.all_reduce(val_stats, op=dist.ReduceOp.SUM)
+                val_recon = float(val_stats[0].item())
+                val_nb = int(val_stats[1].item())
+
             if is_main:
                 denom = max(nb, 1)
+                val_msg = ""
+                if val_nb > 0:
+                    val_msg = f" val_recon={val_recon/max(val_nb, 1):.4f}"
                 print(
                     f"[VAE] Epoch {epoch+1}/{cfg.epochs} "
                     f"loss={total/denom:.4f} "
@@ -557,6 +694,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
                     f"kl={total_kl/denom:.4f} "
                     f"metric={total_metric/denom:.4f} "
                     f"adv={total_adv/denom:.4f}"
+                    f"{val_msg}"
                 )
 
                 if cfg.save_every > 0 and ((epoch + 1) % cfg.save_every == 0):

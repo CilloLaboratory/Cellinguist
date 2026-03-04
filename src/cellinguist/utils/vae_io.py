@@ -83,9 +83,12 @@ def load_vae_checkpoint(
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
     map_location: str | torch.device = "cpu",
+    strict: bool = True,
 ) -> Dict[str, Any]:
     ckpt = torch.load(path, map_location=map_location)
-    model.load_state_dict(ckpt["model_state_dict"])
+    incompat = model.load_state_dict(ckpt["model_state_dict"], strict=bool(strict))
+    ckpt["missing_keys"] = list(getattr(incompat, "missing_keys", []))
+    ckpt["unexpected_keys"] = list(getattr(incompat, "unexpected_keys", []))
     if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     return ckpt

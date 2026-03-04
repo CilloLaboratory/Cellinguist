@@ -77,6 +77,29 @@ class BatchAdversary(nn.Module):
         return self.classifier(z)
 
 
+class PerturbationProjector(nn.Module):
+    """
+    Projects a cytokine perturbation feature vector into a dense embedding.
+    """
+
+    def __init__(self, input_dim: int, output_dim: int) -> None:
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.net = nn.Sequential(
+            nn.Linear(self.input_dim, self.output_dim),
+            nn.GELU(),
+            nn.Linear(self.output_dim, self.output_dim),
+        )
+
+    def forward(self, perturb_vec: torch.Tensor) -> torch.Tensor:
+        if perturb_vec.ndim != 2 or perturb_vec.shape[1] != self.input_dim:
+            raise ValueError(
+                f"perturb_vec must have shape (B, {self.input_dim}), got {tuple(perturb_vec.shape)}."
+            )
+        return self.net(perturb_vec)
+
+
 class FeedForward(nn.Module):
     def __init__(self, d_model: int, ff_mult: int = 4, dropout: float = 0.0) -> None:
         super().__init__()
@@ -173,6 +196,8 @@ class CBOWCellEncoder(nn.Module):
         n_hidden_layers: int,
         n_conditions: Optional[int] = None,
         cond_emb_dim: int = 16,
+        perturbation_dim: Optional[int] = None,
+        perturb_emb_dim: int = 32,
         freeze_gene_embeddings: bool = True,
         input_transform: str = "log1p",   # "log1p" or "none"
     ) -> None:
@@ -202,7 +227,17 @@ class CBOWCellEncoder(nn.Module):
             self.cond_embedding = None
             cond_input_dim = 0
 
-        encoder_input_dim = d_gene + cond_input_dim
+        if perturbation_dim is not None:
+            self.perturb_projector = PerturbationProjector(
+                input_dim=int(perturbation_dim),
+                output_dim=int(perturb_emb_dim),
+            )
+            perturb_input_dim = int(perturb_emb_dim)
+        else:
+            self.perturb_projector = None
+            perturb_input_dim = 0
+
+        encoder_input_dim = d_gene + cond_input_dim + perturb_input_dim
 
         # MLP to latent parameters
         self.mlp_mu = MLP(
@@ -220,7 +255,7 @@ class CBOWCellEncoder(nn.Module):
 
         self.input_transform = input_transform
 
-    def forward(self, x_expr, cond_idx=None):
+    def forward(self, x_expr, cond_idx=None, perturb_vec=None):
         B, G = x_expr.shape
         assert G == self.n_genes
 
@@ -255,6 +290,12 @@ class CBOWCellEncoder(nn.Module):
             h_in = torch.cat([h_cell, c], dim=-1)
         else:
             h_in = h_cell
+
+        if self.perturb_projector is not None:
+            if perturb_vec is None:
+                raise ValueError("perturb_vec is required when perturbation_dim is configured.")
+            p = self.perturb_projector(perturb_vec.to(dtype=h_in.dtype, device=h_in.device))
+            h_in = torch.cat([h_in, p], dim=-1)
 
         if torch.isnan(h_in).any() or torch.isinf(h_in).any():
             print("NaNs/Infs in h_in BEFORE MLP")
@@ -293,6 +334,8 @@ class PerceiverCellEncoder(nn.Module):
         n_hidden_layers: int,
         n_conditions: Optional[int] = None,
         cond_emb_dim: int = 16,
+        perturbation_dim: Optional[int] = None,
+        perturb_emb_dim: int = 32,
         input_transform: str = "log1p",
         library_norm: str = "size_factor",
         library_norm_target_sum: float = 1e4,
@@ -362,7 +405,17 @@ class PerceiverCellEncoder(nn.Module):
             self.cond_embedding = None
             cond_input_dim = 0
 
-        encoder_input_dim = d_model + cond_input_dim
+        if perturbation_dim is not None:
+            self.perturb_projector = PerturbationProjector(
+                input_dim=int(perturbation_dim),
+                output_dim=int(perturb_emb_dim),
+            )
+            perturb_input_dim = int(perturb_emb_dim)
+        else:
+            self.perturb_projector = None
+            perturb_input_dim = 0
+
+        encoder_input_dim = d_model + cond_input_dim + perturb_input_dim
         self.mlp_mu = MLP(
             input_dim=encoder_input_dim,
             output_dim=self.latent_dim,
@@ -380,6 +433,7 @@ class PerceiverCellEncoder(nn.Module):
         self,
         x_expr: torch.Tensor,
         cond_idx: Optional[torch.Tensor] = None,
+        perturb_vec: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz, n_genes = x_expr.shape
         if n_genes != self.n_genes:
@@ -417,6 +471,12 @@ class PerceiverCellEncoder(nn.Module):
         else:
             h_in = h_cell
 
+        if self.perturb_projector is not None:
+            if perturb_vec is None:
+                raise ValueError("perturb_vec is required when perturbation_dim is configured.")
+            p = self.perturb_projector(perturb_vec.to(dtype=h_in.dtype, device=h_in.device))
+            h_in = torch.cat([h_in, p], dim=-1)
+
         mu = self.mlp_mu(h_in)
         logvar = self.mlp_logvar(h_in)
         return mu, logvar
@@ -444,6 +504,8 @@ class ExpressionDecoder(nn.Module):
         n_hidden_layers: int,
         n_conditions: Optional[int] = None,
         cond_emb_dim: int = 16,
+        perturbation_dim: Optional[int] = None,
+        perturb_emb_dim: int = 32,
     ) -> None:
         super().__init__()
         self.n_genes = n_genes
@@ -455,7 +517,17 @@ class ExpressionDecoder(nn.Module):
             self.cond_embedding = None
             cond_input_dim = 0
 
-        decoder_input_dim = latent_dim + cond_input_dim
+        if perturbation_dim is not None:
+            self.perturb_projector = PerturbationProjector(
+                input_dim=int(perturbation_dim),
+                output_dim=int(perturb_emb_dim),
+            )
+            perturb_input_dim = int(perturb_emb_dim)
+        else:
+            self.perturb_projector = None
+            perturb_input_dim = 0
+
+        decoder_input_dim = latent_dim + cond_input_dim + perturb_input_dim
 
         self.mlp = MLP(
             input_dim=decoder_input_dim,
@@ -468,6 +540,8 @@ class ExpressionDecoder(nn.Module):
         self,
         z: torch.Tensor,
         cond_idx: Optional[torch.Tensor] = None,
+        libsize: Optional[torch.Tensor] = None,
+        perturb_vec: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Parameters
@@ -485,6 +559,12 @@ class ExpressionDecoder(nn.Module):
             h_in = torch.cat([z, c], dim=-1)
         else:
             h_in = z
+
+        if self.perturb_projector is not None:
+            if perturb_vec is None:
+                raise ValueError("perturb_vec is required when perturbation_dim is configured.")
+            p = self.perturb_projector(perturb_vec.to(dtype=h_in.dtype, device=h_in.device))
+            h_in = torch.cat([h_in, p], dim=-1)
 
         recon_x = self.mlp(h_in)
         return recon_x
@@ -519,8 +599,9 @@ class GeneVAE(nn.Module):
         self,
         x_expr: torch.Tensor,
         cond_idx: Optional[torch.Tensor] = None,
+        perturb_vec: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.encoder(x_expr, cond_idx)
+        return self.encoder(x_expr, cond_idx, perturb_vec=perturb_vec)
 
     @staticmethod
     def reparameterize(
@@ -536,14 +617,16 @@ class GeneVAE(nn.Module):
         z: torch.Tensor,
         cond_idx: Optional[torch.Tensor] = None,
         libsize: Optional[torch.Tensor] = None,
+        perturb_vec: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.decoder(z, cond_idx, libsize=libsize)
+        return self.decoder(z, cond_idx, libsize=libsize, perturb_vec=perturb_vec)
 
     def forward(
         self,
         x_expr: torch.Tensor,
         cond_idx: Optional[torch.Tensor] = None,
         libsize: Optional[torch.Tensor] = None,
+        perturb_vec: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns
@@ -552,9 +635,9 @@ class GeneVAE(nn.Module):
         mu : (B, latent_dim)
         logvar : (B, latent_dim)
         """
-        mu, logvar = self.encode(x_expr, cond_idx)
+        mu, logvar = self.encode(x_expr, cond_idx, perturb_vec=perturb_vec)
         z = self.reparameterize(mu, logvar)
-        recon_x = self.decode(z, cond_idx, libsize=libsize)
+        recon_x = self.decode(z, cond_idx, libsize=libsize, perturb_vec=perturb_vec)
         return recon_x, mu, logvar
 
     def predict_batch_logits(
@@ -591,6 +674,8 @@ class ZINBExpressionDecoder(nn.Module):
         n_hidden_layers: int,
         n_conditions: Optional[int] = None,
         cond_emb_dim: int = 16,
+        perturbation_dim: Optional[int] = None,
+        perturb_emb_dim: int = 32,
         use_library_size_covariate: bool = False,
         library_size_covariate_eps: float = 1e-8,
     ) -> None:
@@ -609,7 +694,22 @@ class ZINBExpressionDecoder(nn.Module):
             self.cond_embedding = None
             cond_input_dim = 0
 
-        decoder_input_dim = latent_dim + cond_input_dim + (1 if self.use_library_size_covariate else 0)
+        if perturbation_dim is not None:
+            self.perturb_projector = PerturbationProjector(
+                input_dim=int(perturbation_dim),
+                output_dim=int(perturb_emb_dim),
+            )
+            perturb_input_dim = int(perturb_emb_dim)
+        else:
+            self.perturb_projector = None
+            perturb_input_dim = 0
+
+        decoder_input_dim = (
+            latent_dim
+            + cond_input_dim
+            + perturb_input_dim
+            + (1 if self.use_library_size_covariate else 0)
+        )
 
         # MLP for mu (pre-activation)
         self.mlp_mu = MLP(
@@ -636,6 +736,7 @@ class ZINBExpressionDecoder(nn.Module):
         z: torch.Tensor,
         cond_idx: Optional[torch.Tensor] = None,
         libsize: Optional[torch.Tensor] = None,
+        perturb_vec: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Parameters
@@ -654,6 +755,12 @@ class ZINBExpressionDecoder(nn.Module):
             h_in = torch.cat([z, c], dim=-1)
         else:
             h_in = z
+
+        if self.perturb_projector is not None:
+            if perturb_vec is None:
+                raise ValueError("perturb_vec is required when perturbation_dim is configured.")
+            p = self.perturb_projector(perturb_vec.to(dtype=h_in.dtype, device=h_in.device))
+            h_in = torch.cat([h_in, p], dim=-1)
 
         if self.use_library_size_covariate:
             if libsize is None:

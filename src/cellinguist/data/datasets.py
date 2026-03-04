@@ -559,6 +559,7 @@ class SingleCellVAEDataset(Dataset):
       - libsize: scalar FloatTensor (raw-count library size)
       - batch_idx: Optional scalar LongTensor (if batch/cond key is given)
       - cond_idx: Backward-compatible alias of batch_idx
+      - perturb_vec: Optional FloatTensor[C] for cytokine_vector perturbations
     """
 
     def __init__(
@@ -568,6 +569,10 @@ class SingleCellVAEDataset(Dataset):
         layer: Optional[str] = None,
         cond_key: Optional[str] = None,
         batch_key: Optional[str] = None,
+        perturbation_mode: str = "none",
+        cytokine_keys: Optional[list[str]] = None,
+        cytokine_transform: str = "log1p",
+        cytokine_missing_policy: str = "error",
         gene_order: Optional[list[str]] = None,
         transform: str = "log1p",
         backed: bool = True,
@@ -577,6 +582,24 @@ class SingleCellVAEDataset(Dataset):
         self.transform = str(transform)
         if self.transform not in {"log1p", "none"}:
             raise ValueError(f"Unsupported transform: {transform}")
+        self.perturbation_mode = str(perturbation_mode).lower()
+        if self.perturbation_mode not in {"none", "categorical", "cytokine_vector"}:
+            raise ValueError(
+                f"Unsupported perturbation_mode: {perturbation_mode}. "
+                "Use one of: none, categorical, cytokine_vector."
+            )
+        self.cytokine_transform = str(cytokine_transform).lower()
+        if self.cytokine_transform not in {"none", "log1p", "zscore"}:
+            raise ValueError(
+                f"Unsupported cytokine_transform: {cytokine_transform}. "
+                "Use one of: none, log1p, zscore."
+            )
+        self.cytokine_missing_policy = str(cytokine_missing_policy).lower()
+        if self.cytokine_missing_policy not in {"error", "fill_zero"}:
+            raise ValueError(
+                f"Unsupported cytokine_missing_policy: {cytokine_missing_policy}. "
+                "Use one of: error, fill_zero."
+            )
         self._backed = bool(backed)
         self._adata = None
 
@@ -640,6 +663,49 @@ class SingleCellVAEDataset(Dataset):
         self.cond_categories = self.batch_categories
         self.cond_idx = self.batch_idx
 
+        self.cytokine_keys = list(cytokine_keys or [])
+        self._perturb_matrix: Optional[np.ndarray] = None
+        self._perturb_zscore_mean: Optional[np.ndarray] = None
+        self._perturb_zscore_std: Optional[np.ndarray] = None
+        if self.perturbation_mode == "cytokine_vector":
+            if not self.cytokine_keys:
+                raise ValueError(
+                    "cytokine_keys must be provided when perturbation_mode='cytokine_vector'."
+                )
+            missing_cols = [k for k in self.cytokine_keys if k not in adata_probe.obs.columns]
+            if missing_cols:
+                raise ValueError(
+                    f"Cytokine columns not found in adata.obs: {missing_cols}. "
+                    f"Available columns: {list(adata_probe.obs.columns)}"
+                )
+            cytok_df = adata_probe.obs[self.cytokine_keys].copy()
+            cytok_df = cytok_df.apply(pd.to_numeric, errors="coerce")
+            if self.cytokine_missing_policy == "error" and cytok_df.isna().any().any():
+                bad_cols = cytok_df.columns[cytok_df.isna().any(axis=0)].tolist()
+                raise ValueError(
+                    f"NaN/non-numeric cytokine values found in columns: {bad_cols}. "
+                    "Set cytokine_missing_policy='fill_zero' to coerce NaN to 0."
+                )
+            cytok_df = cytok_df.fillna(0.0)
+            cytok_mat = cytok_df.to_numpy(dtype=np.float32)
+            if self.cytokine_transform == "log1p":
+                if (cytok_mat < 0).any():
+                    raise ValueError(
+                        "cytokine_transform='log1p' requires non-negative cytokine values."
+                    )
+                cytok_mat = np.log1p(cytok_mat)
+            elif self.cytokine_transform == "zscore":
+                mean = cytok_mat.mean(axis=0, keepdims=True)
+                std = cytok_mat.std(axis=0, keepdims=True)
+                std = np.where(std > 0, std, 1.0).astype(np.float32)
+                self._perturb_zscore_mean = mean.astype(np.float32).ravel()
+                self._perturb_zscore_std = std.astype(np.float32).ravel()
+                cytok_mat = ((cytok_mat - mean) / std).astype(np.float32)
+            self._perturb_matrix = cytok_mat.astype(np.float32, copy=False)
+        self.n_perturb_features = (
+            int(self._perturb_matrix.shape[1]) if self._perturb_matrix is not None else 0
+        )
+
         if (
             isinstance(adata_or_path, str)
             and self._backed
@@ -691,7 +757,14 @@ class SingleCellVAEDataset(Dataset):
             b = torch.tensor(self.batch_idx[idx], dtype=torch.long)
             out["batch_idx"] = b
             out["cond_idx"] = b
+        if self._perturb_matrix is not None:
+            out["perturb_vec"] = torch.from_numpy(self._perturb_matrix[idx])
         return out
+
+    def get_perturb_matrix(self) -> Optional[np.ndarray]:
+        if self._perturb_matrix is None:
+            return None
+        return self._perturb_matrix
 
     @property
     def adata(self):

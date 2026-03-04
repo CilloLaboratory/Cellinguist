@@ -48,6 +48,12 @@ batch_adv_grl_lambda: 1.0
 batch_adv_hidden_dim: 128
 batch_adv_n_hidden_layers: 1
 batch_invariance_warmup_epochs: 0
+perturbation_mode: "none"
+cytokine_keys: null
+cytokine_transform: "log1p"
+cytokine_missing_policy: "error"
+perturb_emb_dim: 32
+cytokine_holdout_min_active: 2
 
 # training
 lr: 0.0003

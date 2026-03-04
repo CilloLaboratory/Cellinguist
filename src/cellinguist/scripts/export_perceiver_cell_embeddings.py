@@ -22,6 +22,8 @@ def build_perceiver_vae_from_checkpoint(
     checkpoint_path: str,
     n_genes: int,
     n_conditions: int | None,
+    perturbation_dim: int | None,
+    perturb_emb_dim: int,
     device: torch.device,
 ) -> tuple[GeneVAE, dict]:
     ckpt_raw = torch.load(checkpoint_path, map_location="cpu")
@@ -48,6 +50,8 @@ def build_perceiver_vae_from_checkpoint(
         n_hidden_layers=n_hidden_layers,
         n_conditions=n_conditions,
         cond_emb_dim=cond_emb_dim,
+        perturbation_dim=perturbation_dim,
+        perturb_emb_dim=perturb_emb_dim,
         input_transform=input_transform,
         library_norm=library_norm,
         library_norm_target_sum=library_norm_target_sum,
@@ -67,11 +71,27 @@ def build_perceiver_vae_from_checkpoint(
         n_hidden_layers=n_hidden_layers,
         n_conditions=n_conditions,
         cond_emb_dim=cond_emb_dim,
+        perturbation_dim=perturbation_dim,
+        perturb_emb_dim=perturb_emb_dim,
         use_library_size_covariate=bool(train_cfg.get("use_library_size_covariate", False)),
         library_size_covariate_eps=float(train_cfg.get("library_size_covariate_eps", 1e-8)),
     )
     model = GeneVAE(encoder, decoder).to(device)
-    _ = load_vae_checkpoint(checkpoint_path, model, optimizer=None, map_location=device)
+    ckpt = load_vae_checkpoint(
+        checkpoint_path,
+        model,
+        optimizer=None,
+        map_location=device,
+        strict=False,
+    )
+    dropped_adv_keys = [
+        k for k in ckpt.get("unexpected_keys", []) if str(k).startswith("batch_adversary.")
+    ]
+    if dropped_adv_keys:
+        print(
+            f"[export] INFO: ignored {len(dropped_adv_keys)} batch_adversary keys "
+            "from checkpoint during export load."
+        )
     model.eval()
     return model, ckpt_raw
 
@@ -94,22 +114,35 @@ def export_perceiver_cell_embeddings(
     genes_common = ckpt_raw.get("genes_common", None)
     if genes_common is None:
         raise ValueError("Checkpoint does not contain 'genes_common'.")
+    train_cfg = ckpt_raw.get("config", {})
+    perturbation_mode = str(train_cfg.get("perturbation_mode", "none")).lower()
+    cytokine_keys = train_cfg.get("cytokine_keys", None)
+    cytokine_transform = str(train_cfg.get("cytokine_transform", "log1p"))
+    cytokine_missing_policy = str(train_cfg.get("cytokine_missing_policy", "error"))
+    perturb_emb_dim = int(train_cfg.get("perturb_emb_dim", 32))
 
     ds = SingleCellVAEDataset(
         adata_or_path=adata_path,
         gene_key=gene_key,
         layer=layer,
         cond_key=cond_key,
+        perturbation_mode=perturbation_mode,
+        cytokine_keys=cytokine_keys,
+        cytokine_transform=cytokine_transform,
+        cytokine_missing_policy=cytokine_missing_policy,
         gene_order=genes_common,
         transform="none",
         backed=True,
     )
 
     n_conditions = len(ds.cond_categories) if ds.cond_categories is not None else None
+    perturbation_dim = ds.n_perturb_features if perturbation_mode == "cytokine_vector" else None
     model, _ = build_perceiver_vae_from_checkpoint(
         checkpoint_path=checkpoint_path,
         n_genes=ds.n_genes,
         n_conditions=n_conditions,
+        perturbation_dim=perturbation_dim,
+        perturb_emb_dim=perturb_emb_dim,
         device=run_device,
     )
 
@@ -138,8 +171,11 @@ def export_perceiver_cell_embeddings(
             cond_idx = batch.get("cond_idx", None)
             if cond_idx is not None:
                 cond_idx = cond_idx.to(run_device, non_blocking=True)
+            perturb_vec = batch.get("perturb_vec", None)
+            if perturb_vec is not None:
+                perturb_vec = perturb_vec.to(run_device, non_blocking=True)
 
-            mu_z, _ = model.encode(x, cond_idx)
+            mu_z, _ = model.encode(x, cond_idx, perturb_vec=perturb_vec)
             emb_np = mu_z.detach().cpu().numpy()
 
             b = emb_np.shape[0]

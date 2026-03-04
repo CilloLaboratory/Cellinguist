@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, List
 
 import json
 
@@ -124,6 +124,12 @@ class VAETrainConfig:
     batch_adv_hidden_dim: int = 128
     batch_adv_n_hidden_layers: int = 1
     batch_invariance_warmup_epochs: int = 0
+    perturbation_mode: str = "none"  # "none" | "categorical" | "cytokine_vector"
+    cytokine_keys: Optional[List[str]] = None
+    cytokine_transform: str = "log1p"  # "none" | "log1p" | "zscore"
+    cytokine_missing_policy: str = "error"  # "error" | "fill_zero"
+    perturb_emb_dim: int = 32
+    cytokine_holdout_min_active: int = 2
 
     lr: float = 3e-4
     weight_decay: float = 0.0
@@ -157,13 +163,20 @@ class VAEExportConfig:
     layer: Optional[str] = None
     cond_key: Optional[str] = None
     batch_key: Optional[str] = None
+    perturbation_mode: str = "none"  # "none" | "categorical" | "cytokine_vector"
+    cytokine_keys: Optional[List[str]] = None
+    cytokine_transform: str = "log1p"  # "none" | "log1p" | "zscore"
+    cytokine_missing_policy: str = "error"  # "error" | "fill_zero"
+    perturb_emb_dim: int = 32
+    counterfactual_override_path: Optional[str] = None
 
     # Used only when checkpoint/config indicates encoder_type == "cbow".
     gene_emb_tsv: str = ""
     checkpoint_path: str = ""
     out_pred_tsv_gz: str = "pred_mu.tsv.gz"
 
-    max_cells: int = 1000
+    max_cells: Optional[int] = None
+    max_cells_seed: Optional[int] = None
     batch_size: int = 64
     num_workers: int = 4
     device: str = "cuda"
