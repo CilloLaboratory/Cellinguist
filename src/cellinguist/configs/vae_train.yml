@@ -1,0 +1,72 @@
+adata_path: "/home/arc85/Desktop/Cellinguist/cytokine_dict_ser_sub_full_genes_ad_251118.h5ad"
+gene_key: "gene"
+layer: null
+cond_key: null
+batch_key: null
+backed: true
+
+# encoder backbone: "perceiver" (default) or "cbow"
+encoder_type: "perceiver"
+# Required only if encoder_type: "cbow"
+gene_emb_tsv: ""
+
+# model
+latent_dim: 32
+hidden_dim: 256
+n_hidden_layers: 2
+cond_emb_dim: 16
+input_transform: "log1p"
+library_norm: "size_factor"
+library_norm_target_sum: 10000.0
+library_norm_eps: 1.0e-8
+use_library_size_covariate: false
+library_size_covariate_eps: 1.0e-8
+freeze_gene_embeddings: true
+perceiver_d_model: 256
+perceiver_num_latents: 64
+perceiver_num_cross_attn_heads: 8
+perceiver_num_self_attn_heads: 8
+perceiver_num_self_attn_layers: 4
+perceiver_ff_mult: 4
+perceiver_dropout: 0.0
+
+# loss
+kl_weight: 1.0
+use_metric_loss: false
+metric_loss_weight: 0.1
+metric_expr_transform: "log1p"
+metric_margin: 0.2
+metric_temperature: 0.1
+metric_k_pos: 5
+metric_k_neg: 20
+runin_batches: 0
+runin_kl_weight: 0.0
+runin_metric_weight: 0.0
+batch_invariance_method: "none"
+batch_invariance_weight: 0.0
+batch_adv_grl_lambda: 1.0
+batch_adv_hidden_dim: 128
+batch_adv_n_hidden_layers: 1
+batch_invariance_warmup_epochs: 0
+perturbation_mode: "none"
+cytokine_keys: null
+cytokine_transform: "log1p"
+cytokine_missing_policy: "error"
+perturb_emb_dim: 32
+cytokine_holdout_min_active: 2
+
+# training
+lr: 0.0003
+weight_decay: 0.0
+batch_size: 256
+epochs: 50
+num_workers: 4
+device: "cuda"
+grad_clip_norm: null
+seed: 0
+
+# checkpoints
+checkpoint_dir: "/home/arc85/Desktop/cellinguist_results_251125/vae_ckpts"
+run_name: "cytokines_vae_zinb"
+resume_from: null
+save_every: 1

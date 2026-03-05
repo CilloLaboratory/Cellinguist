@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=65", "setuptools_scm>=7"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cellinguist"
+version = "0.0.0.9000"
+description = "Language inspired deep learning for single-cell genomics"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Anthony Cillo", email = "arc85@pitt.edu" }
+]
+
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "torch>=2.0",
+    "anndata>=0.9",
+    "scanpy>=1.9",
+    "pyyaml",
+]
+
+# Optional but recommended
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff",
+    "mypy",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["cellinguist_cbow*"]
+
+# If you have console scripts
+[project.scripts]
+train-cbow = "cellinguist.train.train_cbow:main"
+export-gene-embeddings = "cellinguist.scripts.export_gene_embeddings:main"
+export-cell-embeddings = "cellinguist.scripts.export_cell_embeddings:main"
+train-vae = "cellinguist.train.train_vae:main"
+export-vae-predictions = "cellinguist.scripts.export_vae_predictions:main"
+export-cbow-vae-cell-embeddings = "cellinguist.scripts.export_cbow_vae_cell_embeddings:main"
+export-perceiver-cell-embeddings = "cellinguist.scripts.export_perceiver_cell_embeddings:main"
+export-perceiver-gene-embeddings = "cellinguist.scripts.export_perceiver_gene_embeddings:main"

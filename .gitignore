@@ -178,3 +178,6 @@ cython_debug/
 *.h5ad
 *.csv
 *.tsv
+
+# Mac stuff
+*.DS_Store

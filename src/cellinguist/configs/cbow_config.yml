@@ -1,0 +1,26 @@
+cbow:
+  emb_dim: 128
+  window_size: 5
+  num_negatives: 5
+  num_workers: 12
+  batch_size: 1024
+  epochs: 5
+  lr: 0.001
+  weight_decay: 0.0
+  device: "cuda"
+  use_separate_output: true
+  lr_scheduler: "none"
+  samples_per_cell: 100    # number of random windows per cell per epoch
+
+data:
+  adata_path: "/home/arc85/Desktop/Cellinguist/cytokine_dict_ser_sub_full_genes_ad_251118.h5ad"
+  gene_key: "gene"
+  cond_key: null
+  layer: null
+  n_bins: 20
+  shuffle_tokens: true
+  min_expr: 0.0
+  min_token_count: 1
+
+output:
+  embeddings_path: "../03_output/cytokines_test_outputs_251125/cbow_gene_embeddings.pt"

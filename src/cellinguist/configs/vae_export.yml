@@ -1,0 +1,23 @@
+adata_path: "/home/arc85/Desktop/Cellinguist/cytokine_dict_ser_sub_full_genes_ad_251118.h5ad"
+gene_key: "gene"
+layer: null
+cond_key: null
+batch_key: null
+perturbation_mode: "none"
+cytokine_keys: null
+cytokine_transform: "log1p"
+cytokine_missing_policy: "error"
+perturb_emb_dim: 32
+counterfactual_override_path: null
+
+# Optional for CBOW checkpoints; not used for Perceiver checkpoints.
+gene_emb_tsv: ""
+
+checkpoint_path: "/home/arc85/Desktop/cellinguist_results_251125/vae_ckpts/cytokines_vae_zinb_last.ckpt"
+out_pred_tsv_gz: "/home/arc85/Desktop/cellinguist_results_251125/01_cytokine_testing_251125/03_output/vae_pred_mu.tsv.gz"
+
+max_cells: null
+max_cells_seed: null
+batch_size: 64
+num_workers: 4
+device: "cuda"
