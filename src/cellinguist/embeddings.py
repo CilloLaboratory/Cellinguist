@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Optional
+import json
+from pathlib import Path
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -46,7 +48,6 @@ class GeneEmbedding(nn.Module):
             with torch.no_grad():
                 self.embedding.weight.copy_(pretrained_weight)
 
-        # Optionally freeze the embedding weights
         if freeze:
             self.embedding.weight.requires_grad_(False)
 
@@ -72,18 +73,6 @@ class GeneEmbedding(nn.Module):
 def load_gene_embeddings(path: str, map_location: Optional[str] = None) -> torch.Tensor:
     """
     Load a gene embedding weight matrix from disk.
-
-    Parameters
-    ----------
-    path : str
-        Path to a saved tensor file (typically created by save_gene_embeddings).
-    map_location : Optional[str], default None
-        Passed to torch.load; e.g. "cpu" to force loading on CPU.
-
-    Returns
-    -------
-    torch.Tensor
-        Tensor of shape (n_genes, d_gene) containing the embedding weights.
     """
     return torch.load(path, map_location=map_location)
 
@@ -91,13 +80,6 @@ def load_gene_embeddings(path: str, map_location: Optional[str] = None) -> torch
 def save_gene_embeddings(path: str, weight: torch.Tensor) -> None:
     """
     Save a gene embedding weight matrix to disk.
-
-    Parameters
-    ----------
-    path : str
-        Destination path for the tensor file.
-    weight : torch.Tensor
-        Tensor of shape (n_genes, d_gene) to save.
     """
     if weight.dim() != 2:
         raise ValueError(
@@ -105,6 +87,30 @@ def save_gene_embeddings(path: str, weight: torch.Tensor) -> None:
             f"got shape {tuple(weight.shape)}"
         )
     torch.save(weight, path)
+
+
+def load_token_vocab(path: str) -> Dict[str, int]:
+    """Load a token -> id vocabulary mapping from JSON."""
+    with Path(path).open('r', encoding='utf-8') as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError('Token vocabulary JSON must be an object mapping token strings to ids.')
+
+    token_to_id: Dict[str, int] = {}
+    for token, idx in raw.items():
+        if not isinstance(token, str):
+            raise ValueError('Token vocabulary keys must be strings.')
+        if not isinstance(idx, int):
+            raise ValueError(f"Token vocabulary id for '{token}' must be an integer.")
+        token_to_id[token] = idx
+    return token_to_id
+
+
+def save_token_vocab(path: str, token_to_id: Dict[str, int]) -> None:
+    """Save a token -> id vocabulary mapping to JSON."""
+    normalized = {str(token): int(idx) for token, idx in token_to_id.items()}
+    with Path(path).open('w', encoding='utf-8') as f:
+        json.dump(normalized, f, indent=2, sort_keys=True)
 
 
 def initialize_random_embeddings(
@@ -116,25 +122,6 @@ def initialize_random_embeddings(
 ) -> torch.Tensor:
     """
     Initialize a random gene embedding matrix.
-
-    Parameters
-    ----------
-    n_genes : int
-        Number of genes (rows of the embedding matrix).
-    d_gene : int
-        Embedding dimension (columns of the embedding matrix).
-    seed : Optional[int], default None
-        Random seed for reproducibility. If None, the current RNG state is used.
-    dtype : torch.dtype, default torch.float32
-        Data type of the returned tensor.
-    device : Optional[torch.device], default None
-        Device on which to create the tensor. If None, uses the default device.
-
-    Returns
-    -------
-    torch.Tensor
-        Tensor of shape (n_genes, d_gene) with randomly initialized embeddings.
-        Uses a standard normal distribution scaled by 1/sqrt(d_gene).
     """
     if seed is not None:
         gen = torch.Generator(device=device)
@@ -142,7 +129,6 @@ def initialize_random_embeddings(
     else:
         gen = None
 
-    # Standard normal scaled by 1/sqrt(d_gene), a common embedding init scheme
     weight = torch.randn(
         n_genes,
         d_gene,

@@ -34,6 +34,23 @@ train-cbow --config cbow_config.yml
 
 An example config file can be found in the configs directory of this repository.
 
+For feature work, create a branch before modifying training code so `main` remains unchanged:
+
+```
+git checkout -b feature/cbow-staged-training
+```
+
+CBOW training now also writes a token vocabulary JSON next to the learned embedding tensor. That vocabulary should be preserved and reused for any warm start or staged continuation run.
+
+### Staged CBOW continuation
+
+To continue from an existing CBOW run, provide both the saved embedding tensor and its matching `.vocab.json` file:
+
+- `vocab_expansion_mode: "strict"` requires the new dataset to produce the exact same token vocabulary.
+- `vocab_expansion_mode: "expand"` reuses rows for shared `GENE__BIN` tokens and leaves newly introduced tokens randomly initialized.
+
+This is intended for workflows such as HVG-first pretraining followed by expansion to a larger gene set. When `use_separate_output: true`, warm start currently restores the exported input embedding rows used downstream; the separate output embedding matrix remains randomly initialized.
+
 ## VAE Training
 Singe-GPU training:
 

@@ -69,6 +69,9 @@ class CBOWConfig:
     lr_gamma: float = 0.5
 
     samples_per_cell: int = 1
+    init_embeddings_path: Optional[str] = None
+    init_vocab_path: Optional[str] = None
+    vocab_expansion_mode: str = "strict"  # "strict" or "expand"
 
 
 # ---------------------------------------------------------------------------

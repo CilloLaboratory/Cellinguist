@@ -11,6 +11,9 @@ cbow:
   use_separate_output: true
   lr_scheduler: "none"
   samples_per_cell: 100    # number of random windows per cell per epoch
+  init_embeddings_path: null  # baseline: leave null
+  init_vocab_path: null       # strict/expand warm start: path to prior .vocab.json
+  vocab_expansion_mode: "strict"  # "strict" reuses identical vocab; "expand" adds new tokens
 
 data:
   adata_path: "/home/arc85/Desktop/Cellinguist/cytokine_dict_ser_sub_full_genes_ad_251118.h5ad"
@@ -24,3 +27,17 @@ data:
 
 output:
   embeddings_path: "../03_output/cytokines_test_outputs_251125/cbow_gene_embeddings.pt"
+
+# Baseline training:
+#   init_embeddings_path: null
+#   init_vocab_path: null
+#
+# Strict warm start:
+#   init_embeddings_path: "/path/to/previous/cbow_gene_embeddings.pt"
+#   init_vocab_path: "/path/to/previous/cbow_gene_embeddings.vocab.json"
+#   vocab_expansion_mode: "strict"
+#
+# Vocabulary expansion warm start:
+#   init_embeddings_path: "/path/to/hvg/cbow_gene_embeddings.pt"
+#   init_vocab_path: "/path/to/hvg/cbow_gene_embeddings.vocab.json"
+#   vocab_expansion_mode: "expand"
