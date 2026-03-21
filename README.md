@@ -73,6 +73,16 @@ export-transformer-gene-embeddings \
 
 (For Perceiver checkpoints, use `export-perceiver-gene-embeddings`.)
 
+To export cell embeddings from a trained Transformer VAE checkpoint:
+
+```
+export-transformer-cell-embeddings \
+  --adata /path/to/input.h5ad \
+  --checkpoint /path/to/vae_transformer_last.ckpt \
+  --out /path/to/transformer_cell_embeddings.tsv.gz \
+  --device "cuda"
+```
+
 To export cell embeddings from the second phase of training:
 
 ```

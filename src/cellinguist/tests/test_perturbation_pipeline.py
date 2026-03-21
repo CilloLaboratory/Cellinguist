@@ -15,6 +15,7 @@ from cellinguist.models.vae import (
     TransformerCellEncoder,
     ZINBExpressionDecoder,
 )
+from cellinguist.scripts.export_transformer_cell_embeddings import export_transformer_cell_embeddings
 from cellinguist.scripts.export_transformer_gene_embeddings import export_transformer_gene_embeddings
 from cellinguist.scripts.export_vae_predictions import _load_counterfactual_overrides
 from cellinguist.utils.perturbation_split import build_cytokine_combo_split
@@ -416,6 +417,101 @@ def test_export_transformer_gene_embeddings_rejects_non_transformer(tmp_path: Pa
 
     try:
         export_transformer_gene_embeddings(str(ckpt_path), str(tmp_path / "out.tsv.gz"))
+        assert False, "Expected ValueError for non-transformer checkpoint."
+    except ValueError:
+        pass
+
+
+def test_export_transformer_cell_embeddings_writes_tsv(tmp_path: Path) -> None:
+    h5ad_path = _write_tiny_h5ad(tmp_path)
+
+    encoder = TransformerCellEncoder(
+        n_genes=4,
+        latent_dim=5,
+        hidden_dim=8,
+        n_hidden_layers=1,
+        input_transform="none",
+        transformer_d_model=8,
+        transformer_n_heads=2,
+        transformer_n_layers=1,
+        transformer_ff_mult=2,
+        token_mlp_hidden_dim=8,
+        token_mlp_layers=1,
+    )
+    decoder = ZINBExpressionDecoder(
+        n_genes=4,
+        latent_dim=5,
+        hidden_dim=8,
+        n_hidden_layers=1,
+    )
+    model = GeneVAE(encoder, decoder)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    ckpt_path = tmp_path / "transformer_cell_export.ckpt"
+    save_vae_checkpoint(
+        path=str(ckpt_path),
+        model=model,
+        optimizer=opt,
+        epoch=0,
+        genes_common=["g0", "g1", "g2", "g3"],
+        config_snapshot={
+            "encoder_type": "transformer",
+            "latent_dim": 5,
+            "hidden_dim": 8,
+            "n_hidden_layers": 1,
+            "input_transform": "none",
+            "transformer_d_model": 8,
+            "transformer_n_heads": 2,
+            "transformer_n_layers": 1,
+            "transformer_ff_mult": 2,
+            "token_mlp_hidden_dim": 8,
+            "token_mlp_layers": 1,
+            "perturbation_mode": "none",
+        },
+        gene_emb_source="",
+    )
+
+    out_path = tmp_path / "transformer_cell_emb.tsv.gz"
+    export_transformer_cell_embeddings(
+        adata_path=str(h5ad_path),
+        checkpoint_path=str(ckpt_path),
+        out_tsv_gz=str(out_path),
+        gene_key="gene",
+        batch_size=2,
+        num_workers=0,
+        device="cpu",
+        backed=False,
+    )
+
+    df = pd.read_csv(out_path, sep="\t")
+    assert df.shape[0] == 4
+    assert df.columns.tolist() == ["cell_id", "dim_1", "dim_2", "dim_3", "dim_4", "dim_5"]
+    assert df["cell_id"].tolist() == ["cell_0", "cell_1", "cell_2", "cell_3"]
+
+
+def test_export_transformer_cell_embeddings_rejects_non_transformer(tmp_path: Path) -> None:
+    h5ad_path = _write_tiny_h5ad(tmp_path)
+    ckpt_path = tmp_path / "not_transformer_cell_export.ckpt"
+    torch.save(
+        {
+            "config": {"encoder_type": "perceiver"},
+            "genes_common": ["g0", "g1", "g2", "g3"],
+            "model_state_dict": {},
+        },
+        ckpt_path,
+    )
+
+    try:
+        export_transformer_cell_embeddings(
+            adata_path=str(h5ad_path),
+            checkpoint_path=str(ckpt_path),
+            out_tsv_gz=str(tmp_path / "unused.tsv.gz"),
+            gene_key="gene",
+            batch_size=2,
+            num_workers=0,
+            device="cpu",
+            backed=False,
+        )
         assert False, "Expected ValueError for non-transformer checkpoint."
     except ValueError:
         pass
