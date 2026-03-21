@@ -164,9 +164,19 @@ class SelfAttentionBlock(nn.Module):
         self.norm_ff = nn.LayerNorm(d_model)
         self.ff = FeedForward(d_model=d_model, ff_mult=ff_mult, dropout=dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         qkv = self.norm_attn(x)
-        attn_out, _ = self.attn(qkv, qkv, qkv, need_weights=False)
+        attn_out, _ = self.attn(
+            qkv,
+            qkv,
+            qkv,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
         x = x + attn_out
         x = x + self.ff(self.norm_ff(x))
         return x
@@ -464,6 +474,201 @@ class PerceiverCellEncoder(nn.Module):
             latents = block(latents)
 
         h_cell = self.final_norm(latents.mean(dim=1))  # (B, D)
+
+        if self.cond_embedding is not None and cond_idx is not None:
+            c = self.cond_embedding(cond_idx)
+            h_in = torch.cat([h_cell, c], dim=-1)
+        else:
+            h_in = h_cell
+
+        if self.perturb_projector is not None:
+            if perturb_vec is None:
+                raise ValueError("perturb_vec is required when perturbation_dim is configured.")
+            p = self.perturb_projector(perturb_vec.to(dtype=h_in.dtype, device=h_in.device))
+            h_in = torch.cat([h_in, p], dim=-1)
+
+        mu = self.mlp_mu(h_in)
+        logvar = self.mlp_logvar(h_in)
+        return mu, logvar
+
+
+class TransformerCellEncoder(nn.Module):
+    """
+    Transformer cell encoder:
+      1) Build variable-length per-cell tokens from expressed genes only.
+      2) Token = MLP([gene_id_embedding, expression_scalar]).
+      3) Prepend a learned CLS token and run Transformer self-attention.
+      4) Use CLS hidden state as pooled cell representation.
+      5) Map to (mu, logvar) for VAE posterior.
+    """
+
+    def __init__(
+        self,
+        n_genes: int,
+        latent_dim: int,
+        hidden_dim: int,
+        n_hidden_layers: int,
+        n_conditions: Optional[int] = None,
+        cond_emb_dim: int = 16,
+        perturbation_dim: Optional[int] = None,
+        perturb_emb_dim: int = 32,
+        input_transform: str = "log1p",
+        transformer_d_model: int = 256,
+        transformer_n_heads: int = 8,
+        transformer_n_layers: int = 4,
+        transformer_ff_mult: int = 4,
+        transformer_dropout: float = 0.0,
+        token_mlp_hidden_dim: int = 256,
+        token_mlp_layers: int = 2,
+        max_tokens_per_cell: Optional[int] = None,
+        min_expr_for_token: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.n_genes = int(n_genes)
+        self.latent_dim = int(latent_dim)
+        self.input_transform = str(input_transform)
+        if self.input_transform not in {"log1p", "none"}:
+            raise ValueError(f"Unsupported input_transform: {input_transform}")
+        self.max_tokens_per_cell = None if max_tokens_per_cell is None else int(max_tokens_per_cell)
+        if self.max_tokens_per_cell is not None and self.max_tokens_per_cell <= 0:
+            raise ValueError("max_tokens_per_cell must be > 0 when provided.")
+        self.min_expr_for_token = float(min_expr_for_token)
+
+        d_model = int(transformer_d_model)
+        n_heads = int(transformer_n_heads)
+        if d_model % n_heads != 0:
+            raise ValueError("transformer_d_model must be divisible by transformer_n_heads.")
+        if int(transformer_n_layers) <= 0:
+            raise ValueError("transformer_n_layers must be > 0.")
+        if int(token_mlp_layers) < 0:
+            raise ValueError("token_mlp_layers must be >= 0.")
+
+        self.gene_embedding = nn.Embedding(self.n_genes, d_model)
+        self.token_mlp = MLP(
+            input_dim=d_model + 1,
+            output_dim=d_model,
+            hidden_dim=int(token_mlp_hidden_dim),
+            n_hidden_layers=int(token_mlp_layers),
+            activation=nn.GELU(),
+        )
+        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.pos_embedding = nn.Embedding(self.n_genes + 1, d_model)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_model * int(transformer_ff_mult),
+            dropout=float(transformer_dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer=enc_layer,
+            num_layers=int(transformer_n_layers),
+        )
+        self.final_norm = nn.LayerNorm(d_model)
+
+        if n_conditions is not None:
+            self.cond_embedding = nn.Embedding(n_conditions, cond_emb_dim)
+            cond_input_dim = cond_emb_dim
+        else:
+            self.cond_embedding = None
+            cond_input_dim = 0
+
+        if perturbation_dim is not None:
+            self.perturb_projector = PerturbationProjector(
+                input_dim=int(perturbation_dim),
+                output_dim=int(perturb_emb_dim),
+            )
+            perturb_input_dim = int(perturb_emb_dim)
+        else:
+            self.perturb_projector = None
+            perturb_input_dim = 0
+
+        encoder_input_dim = d_model + cond_input_dim + perturb_input_dim
+        self.mlp_mu = MLP(
+            input_dim=encoder_input_dim,
+            output_dim=self.latent_dim,
+            hidden_dim=hidden_dim,
+            n_hidden_layers=n_hidden_layers,
+        )
+        self.mlp_logvar = MLP(
+            input_dim=encoder_input_dim,
+            output_dim=self.latent_dim,
+            hidden_dim=hidden_dim,
+            n_hidden_layers=n_hidden_layers,
+        )
+
+    def _expr_for_tokens(self, x_expr: torch.Tensor) -> torch.Tensor:
+        if self.input_transform == "log1p":
+            return torch.log1p(x_expr.clamp_min(0.0))
+        if self.input_transform == "none":
+            return x_expr
+        raise ValueError(f"Unsupported input_transform: {self.input_transform}")
+
+    def _build_token_batch(
+        self,
+        x_expr: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bsz, n_genes = x_expr.shape
+        if n_genes != self.n_genes:
+            raise ValueError(
+                f"Expected {self.n_genes} genes, but got {n_genes}. "
+                "Dataset gene order/shape does not match encoder setup."
+            )
+
+        x_tok = self._expr_for_tokens(x_expr)
+        selected_indices: list[torch.Tensor] = []
+        max_seq_len = 1  # CLS only fallback
+
+        for i in range(bsz):
+            vals_raw = x_expr[i]
+            keep = vals_raw > self.min_expr_for_token
+            idx = torch.nonzero(keep, as_tuple=False).squeeze(-1)
+            if idx.numel() > 0 and self.max_tokens_per_cell is not None and idx.numel() > self.max_tokens_per_cell:
+                vals_keep = vals_raw[idx]
+                topk = torch.topk(vals_keep, k=self.max_tokens_per_cell, largest=True).indices
+                idx = idx[topk]
+            selected_indices.append(idx)
+            seq_len = int(idx.numel()) + 1
+            if seq_len > max_seq_len:
+                max_seq_len = seq_len
+
+        tokens = x_expr.new_zeros((bsz, max_seq_len, self.gene_embedding.embedding_dim))
+        key_padding_mask = torch.ones((bsz, max_seq_len), dtype=torch.bool, device=x_expr.device)
+
+        cls = self.cls_token.to(dtype=tokens.dtype, device=tokens.device).squeeze(0).squeeze(0)
+        cls_pos = self.pos_embedding(
+            torch.tensor([0], dtype=torch.long, device=x_expr.device)
+        ).squeeze(0).to(dtype=tokens.dtype, device=tokens.device)
+
+        for i, idx in enumerate(selected_indices):
+            tokens[i, 0, :] = cls + cls_pos
+            key_padding_mask[i, 0] = False
+            if idx.numel() == 0:
+                continue
+
+            expr_vals = x_tok[i, idx].unsqueeze(-1).to(dtype=tokens.dtype)
+            gene_emb = self.gene_embedding(idx)
+            gene_pos = self.pos_embedding(idx + 1)
+            token_in = torch.cat([gene_emb, expr_vals], dim=-1)
+            token_vec = self.token_mlp(token_in) + gene_pos
+            seq_len = int(idx.numel())
+            tokens[i, 1 : seq_len + 1, :] = token_vec
+            key_padding_mask[i, 1 : seq_len + 1] = False
+
+        return tokens, key_padding_mask
+
+    def forward(
+        self,
+        x_expr: torch.Tensor,
+        cond_idx: Optional[torch.Tensor] = None,
+        perturb_vec: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tokens, key_padding_mask = self._build_token_batch(x_expr)
+        hidden = self.transformer(tokens, src_key_padding_mask=key_padding_mask)
+        h_cell = self.final_norm(hidden[:, 0, :])
 
         if self.cond_embedding is not None and cond_idx is not None:
             c = self.cond_embedding(cond_idx)

@@ -12,6 +12,7 @@ from cellinguist.models.vae import (
     BatchAdversary,
     GeneVAE,
     PerceiverCellEncoder,
+    TransformerCellEncoder,
     ZINBExpressionDecoder,
 )
 from cellinguist.scripts.export_vae_predictions import _load_counterfactual_overrides
@@ -266,3 +267,108 @@ def test_minimal_train_step_all_modes(tmp_path: Path) -> None:
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+
+
+def test_transformer_tokenization_cls_and_padding() -> None:
+    x = torch.tensor(
+        [
+            [0.0, 2.0, 0.0, 5.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    enc = TransformerCellEncoder(
+        n_genes=4,
+        latent_dim=5,
+        hidden_dim=8,
+        n_hidden_layers=1,
+        input_transform="log1p",
+        transformer_d_model=8,
+        transformer_n_heads=2,
+        transformer_n_layers=1,
+        transformer_ff_mult=2,
+        token_mlp_hidden_dim=8,
+        token_mlp_layers=1,
+        max_tokens_per_cell=None,
+        min_expr_for_token=0.0,
+    )
+    tokens, pad_mask = enc._build_token_batch(x)
+    assert tokens.shape[0] == 2
+    assert tokens.shape[2] == 8
+    assert tokens.shape[1] == 3  # CLS + 2 expressed genes (max in batch)
+    assert pad_mask.shape == (2, 3)
+    assert bool(pad_mask[0, 0].item()) is False
+    assert bool(pad_mask[0, 1].item()) is False
+    assert bool(pad_mask[0, 2].item()) is False
+    assert bool(pad_mask[1, 0].item()) is False
+    assert bool(pad_mask[1, 1].item()) is True
+    assert bool(pad_mask[1, 2].item()) is True
+
+
+def test_transformer_model_forward_with_and_without_perturb() -> None:
+    x = torch.rand(3, 4)
+    cond = torch.tensor([0, 1, 0], dtype=torch.long)
+    perturb = torch.rand(3, 2)
+
+    enc_none = TransformerCellEncoder(
+        n_genes=4,
+        latent_dim=5,
+        hidden_dim=8,
+        n_hidden_layers=1,
+        n_conditions=2,
+        cond_emb_dim=4,
+        input_transform="none",
+        transformer_d_model=8,
+        transformer_n_heads=2,
+        transformer_n_layers=1,
+        transformer_ff_mult=2,
+        token_mlp_hidden_dim=8,
+        token_mlp_layers=1,
+    )
+    dec_none = ZINBExpressionDecoder(
+        n_genes=4,
+        latent_dim=5,
+        hidden_dim=8,
+        n_hidden_layers=1,
+        n_conditions=2,
+        cond_emb_dim=4,
+    )
+    model_none = GeneVAE(enc_none, dec_none)
+    recon_out, _, _ = model_none(x, cond_idx=cond, libsize=x.sum(dim=1))
+    assert recon_out[0].shape == (3, 4)
+
+    enc_pert = TransformerCellEncoder(
+        n_genes=4,
+        latent_dim=5,
+        hidden_dim=8,
+        n_hidden_layers=1,
+        n_conditions=2,
+        cond_emb_dim=4,
+        perturbation_dim=2,
+        perturb_emb_dim=6,
+        input_transform="none",
+        transformer_d_model=8,
+        transformer_n_heads=2,
+        transformer_n_layers=1,
+        transformer_ff_mult=2,
+        token_mlp_hidden_dim=8,
+        token_mlp_layers=1,
+    )
+    dec_pert = ZINBExpressionDecoder(
+        n_genes=4,
+        latent_dim=5,
+        hidden_dim=8,
+        n_hidden_layers=1,
+        n_conditions=2,
+        cond_emb_dim=4,
+        perturbation_dim=2,
+        perturb_emb_dim=6,
+    )
+    model_pert = GeneVAE(enc_pert, dec_pert)
+    recon_out2, _, _ = model_pert(
+        x,
+        cond_idx=cond,
+        libsize=x.sum(dim=1),
+        perturb_vec=perturb,
+    )
+    assert recon_out2[0].shape == (3, 4)

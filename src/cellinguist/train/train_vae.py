@@ -20,6 +20,7 @@ from cellinguist.data.datasets import SingleCellVAEDataset
 from cellinguist.models.vae import (
     CBOWCellEncoder,
     PerceiverCellEncoder,
+    TransformerCellEncoder,
     ZINBExpressionDecoder,
     BatchAdversary,
     GeneVAE,
@@ -122,8 +123,10 @@ def train_vae(cfg: VAETrainConfig) -> str:
 
         is_main = rank == 0
         encoder_type = str(cfg.encoder_type).lower()
-        if encoder_type not in {"cbow", "perceiver"}:
-            raise ValueError(f"Unsupported encoder_type: {cfg.encoder_type}. Use 'cbow' or 'perceiver'.")
+        if encoder_type not in {"cbow", "perceiver", "transformer"}:
+            raise ValueError(
+                f"Unsupported encoder_type: {cfg.encoder_type}. Use 'cbow', 'perceiver', or 'transformer'."
+            )
         _log(rank, f"encoder_type={encoder_type}")
         if cfg.use_metric_loss:
             if cfg.metric_loss_weight < 0:
@@ -237,7 +240,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
             genes_common = vae_dataset.gene_order
             n_cells, n_genes = vae_dataset.n_cells, vae_dataset.n_genes
             if is_main:
-                print(f"VAE dataset: {n_cells} cells, {n_genes} genes (Perceiver encoder)")
+                print(f"VAE dataset: {n_cells} cells, {n_genes} genes ({encoder_type} encoder)")
             emb = None
             gene_emb_source = ""
         _log(rank, f"dataset ready: n_cells={n_cells} n_genes={n_genes}")
@@ -270,7 +273,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 freeze_gene_embeddings=cfg.freeze_gene_embeddings,
                 input_transform=cfg.input_transform,
             )
-        else:
+        elif encoder_type == "perceiver":
             encoder = PerceiverCellEncoder(
                 n_genes=n_genes,
                 latent_dim=cfg.latent_dim,
@@ -291,6 +294,27 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 perceiver_num_self_attn_layers=cfg.perceiver_num_self_attn_layers,
                 perceiver_ff_mult=cfg.perceiver_ff_mult,
                 perceiver_dropout=cfg.perceiver_dropout,
+            )
+        else:
+            encoder = TransformerCellEncoder(
+                n_genes=n_genes,
+                latent_dim=cfg.latent_dim,
+                hidden_dim=cfg.hidden_dim,
+                n_hidden_layers=cfg.n_hidden_layers,
+                n_conditions=n_conditions,
+                cond_emb_dim=cfg.cond_emb_dim,
+                perturbation_dim=perturbation_dim,
+                perturb_emb_dim=cfg.perturb_emb_dim,
+                input_transform=cfg.input_transform,
+                transformer_d_model=cfg.transformer_d_model,
+                transformer_n_heads=cfg.transformer_n_heads,
+                transformer_n_layers=cfg.transformer_n_layers,
+                transformer_ff_mult=cfg.transformer_ff_mult,
+                transformer_dropout=cfg.transformer_dropout,
+                token_mlp_hidden_dim=cfg.token_mlp_hidden_dim,
+                token_mlp_layers=cfg.token_mlp_layers,
+                max_tokens_per_cell=cfg.max_tokens_per_cell,
+                min_expr_for_token=cfg.min_expr_for_token,
             )
         decoder = ZINBExpressionDecoder(
             n_genes=n_genes,

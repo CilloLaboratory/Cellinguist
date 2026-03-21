@@ -5,8 +5,8 @@ cond_key: null
 batch_key: null
 backed: true
 
-# encoder backbone: "perceiver" (default) or "cbow"
-encoder_type: "perceiver"
+# encoder backbone: "transformer" (default), "perceiver", or "cbow"
+encoder_type: "transformer"
 # Required only if encoder_type: "cbow"
 gene_emb_tsv: ""
 
@@ -29,6 +29,15 @@ perceiver_num_self_attn_heads: 8
 perceiver_num_self_attn_layers: 4
 perceiver_ff_mult: 4
 perceiver_dropout: 0.0
+transformer_d_model: 256
+transformer_n_heads: 8
+transformer_n_layers: 4
+transformer_ff_mult: 4
+transformer_dropout: 0.0
+token_mlp_hidden_dim: 256
+token_mlp_layers: 2
+max_tokens_per_cell: null
+min_expr_for_token: 0.0
 
 # loss
 kl_weight: 1.0

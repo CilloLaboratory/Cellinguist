@@ -86,7 +86,7 @@ class VAETrainConfig:
 
     # Used only when encoder_type == "cbow".
     gene_emb_tsv: str = ""
-    encoder_type: str = "perceiver"  # "perceiver" or "cbow"
+    encoder_type: str = "transformer"  # "transformer" or "perceiver" or "cbow"
 
     latent_dim: int = 32
     hidden_dim: int = 256
@@ -106,6 +106,16 @@ class VAETrainConfig:
     perceiver_num_self_attn_layers: int = 4
     perceiver_ff_mult: int = 4
     perceiver_dropout: float = 0.0
+
+    transformer_d_model: int = 256
+    transformer_n_heads: int = 8
+    transformer_n_layers: int = 4
+    transformer_ff_mult: int = 4
+    transformer_dropout: float = 0.0
+    token_mlp_hidden_dim: int = 256
+    token_mlp_layers: int = 2
+    max_tokens_per_cell: Optional[int] = None
+    min_expr_for_token: float = 0.0
 
     kl_weight: float = 1.0
     use_metric_loss: bool = False

@@ -13,9 +13,10 @@ pip install -e .
 ```
 
 ## Cellinguist workflow
-Training of a base model proceeds in two phases:
-- CBOW training to learn gene embeddings
-- Using CBOW gene embeddings to train a variational autoencoder to learn cell embeddings
+Training of a base model is VAE-based with configurable encoder backbones:
+- Transformer encoder (default): gene-id + log1p(expression) token MLP, CLS pooling
+- Perceiver encoder (legacy-compatible)
+- CBOW encoder with external gene embeddings (legacy-compatible)
 
 The following functionality is currently implemented:
 - Learning gene embeddings for co-expression patterns
@@ -24,11 +25,11 @@ The following functionality is currently implemented:
 - Data integration / batch correction
 - Cell type prediction from reference
 
-## Learning gene embeddings
+## Optional CBOW gene embedding pretraining
 
-We first learn gene embeddings, using h5ad structured genomic data as input. Training is implemented with the following command, using an input config file: 
+CBOW pretraining is optional and only required when `encoder_type: "cbow"`.
 
-``` 
+```
 train-cbow --config cbow_config.yml
 ```
 

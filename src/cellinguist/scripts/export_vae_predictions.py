@@ -17,6 +17,7 @@ from cellinguist.data.datasets import SingleCellVAEDataset
 from cellinguist.models.vae import (
     CBOWCellEncoder,
     PerceiverCellEncoder,
+    TransformerCellEncoder,
     ZINBExpressionDecoder,
     GeneVAE,
 )
@@ -61,7 +62,7 @@ def export_predictions(cfg: VAEExportConfig) -> None:
     gene_emb_source = ckpt_raw.get("gene_emb_source", None)
     train_cfg = ckpt_raw.get("config", {})
     encoder_type = str(train_cfg.get("encoder_type", "cbow")).lower()
-    if encoder_type not in {"cbow", "perceiver"}:
+    if encoder_type not in {"cbow", "perceiver", "transformer"}:
         raise ValueError(f"Unsupported encoder_type in checkpoint: {encoder_type}")
 
     perturbation_mode = str(train_cfg.get("perturbation_mode", cfg.perturbation_mode)).lower()
@@ -133,7 +134,7 @@ def export_predictions(cfg: VAEExportConfig) -> None:
             freeze_gene_embeddings=freeze_gene_embeddings,
             input_transform=input_transform,
         )
-    else:
+    elif encoder_type == "perceiver":
         encoder = PerceiverCellEncoder(
             n_genes=n_genes,
             latent_dim=latent_dim,
@@ -154,6 +155,27 @@ def export_predictions(cfg: VAEExportConfig) -> None:
             perceiver_num_self_attn_layers=int(train_cfg.get("perceiver_num_self_attn_layers", 4)),
             perceiver_ff_mult=int(train_cfg.get("perceiver_ff_mult", 4)),
             perceiver_dropout=float(train_cfg.get("perceiver_dropout", 0.0)),
+        )
+    else:
+        encoder = TransformerCellEncoder(
+            n_genes=n_genes,
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            n_hidden_layers=n_hidden_layers,
+            n_conditions=n_conditions,
+            cond_emb_dim=cond_emb_dim,
+            perturbation_dim=perturbation_dim,
+            perturb_emb_dim=perturb_emb_dim,
+            input_transform=input_transform,
+            transformer_d_model=int(train_cfg.get("transformer_d_model", 256)),
+            transformer_n_heads=int(train_cfg.get("transformer_n_heads", 8)),
+            transformer_n_layers=int(train_cfg.get("transformer_n_layers", 4)),
+            transformer_ff_mult=int(train_cfg.get("transformer_ff_mult", 4)),
+            transformer_dropout=float(train_cfg.get("transformer_dropout", 0.0)),
+            token_mlp_hidden_dim=int(train_cfg.get("token_mlp_hidden_dim", 256)),
+            token_mlp_layers=int(train_cfg.get("token_mlp_layers", 2)),
+            max_tokens_per_cell=train_cfg.get("max_tokens_per_cell", None),
+            min_expr_for_token=float(train_cfg.get("min_expr_for_token", 0.0)),
         )
     decoder = ZINBExpressionDecoder(
         n_genes=n_genes,
