@@ -63,6 +63,16 @@ export-gene-embeddings \
   --min-expr 0.0
 ```
 
+To export gene embeddings directly from a trained Transformer VAE checkpoint:
+
+```
+export-transformer-gene-embeddings \
+  --checkpoint /path/to/vae_transformer_last.ckpt \
+  --out /path/to/transformer_gene_embeddings.tsv.gz
+```
+
+(For Perceiver checkpoints, use `export-perceiver-gene-embeddings`.)
+
 To export cell embeddings from the second phase of training:
 
 ```

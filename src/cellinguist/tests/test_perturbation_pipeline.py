@@ -15,6 +15,7 @@ from cellinguist.models.vae import (
     TransformerCellEncoder,
     ZINBExpressionDecoder,
 )
+from cellinguist.scripts.export_transformer_gene_embeddings import export_transformer_gene_embeddings
 from cellinguist.scripts.export_vae_predictions import _load_counterfactual_overrides
 from cellinguist.utils.perturbation_split import build_cytokine_combo_split
 from cellinguist.utils.vae_io import load_vae_checkpoint, save_vae_checkpoint
@@ -372,3 +373,49 @@ def test_transformer_model_forward_with_and_without_perturb() -> None:
         perturb_vec=perturb,
     )
     assert recon_out2[0].shape == (3, 4)
+
+
+def test_export_transformer_gene_embeddings_writes_tsv(tmp_path: Path) -> None:
+    ckpt_path = tmp_path / "transformer.ckpt"
+    out_path = tmp_path / "transformer_gene_emb.tsv.gz"
+
+    torch.save(
+        {
+            "config": {"encoder_type": "transformer"},
+            "genes_common": ["g0", "g1"],
+            "model_state_dict": {
+                "encoder.gene_embedding.weight": torch.tensor(
+                    [[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32
+                )
+            },
+        },
+        ckpt_path,
+    )
+
+    export_transformer_gene_embeddings(str(ckpt_path), str(out_path))
+
+    df = pd.read_csv(out_path, sep="\t")
+    assert list(df.columns) == ["gene", "dim_1", "dim_2"]
+    assert df["gene"].tolist() == ["g0", "g1"]
+    assert np.allclose(df[["dim_1", "dim_2"]].to_numpy(), np.array([[1.0, 2.0], [3.0, 4.0]]))
+
+
+def test_export_transformer_gene_embeddings_rejects_non_transformer(tmp_path: Path) -> None:
+    ckpt_path = tmp_path / "not_transformer.ckpt"
+
+    torch.save(
+        {
+            "config": {"encoder_type": "perceiver"},
+            "genes_common": ["g0"],
+            "model_state_dict": {
+                "encoder.gene_embedding.weight": torch.tensor([[1.0, 2.0]], dtype=torch.float32)
+            },
+        },
+        ckpt_path,
+    )
+
+    try:
+        export_transformer_gene_embeddings(str(ckpt_path), str(tmp_path / "out.tsv.gz"))
+        assert False, "Expected ValueError for non-transformer checkpoint."
+    except ValueError:
+        pass
