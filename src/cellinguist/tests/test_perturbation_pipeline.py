@@ -481,6 +481,8 @@ def test_export_transformer_cell_embeddings_writes_tsv(tmp_path: Path) -> None:
         num_workers=0,
         device="cpu",
         backed=False,
+        max_tokens_per_cell_override=2,
+        min_expr_for_token_override=0.0,
     )
 
     df = pd.read_csv(out_path, sep="\t")

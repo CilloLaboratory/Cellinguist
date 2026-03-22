@@ -4,7 +4,6 @@ import argparse
 import gzip
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
@@ -25,6 +24,8 @@ def build_transformer_vae_from_checkpoint(
     perturbation_dim: int | None,
     perturb_emb_dim: int,
     device: torch.device,
+    max_tokens_per_cell_override: int | None = None,
+    min_expr_for_token_override: float | None = None,
 ) -> tuple[GeneVAE, dict]:
     ckpt_raw = torch.load(checkpoint_path, map_location="cpu")
     train_cfg = ckpt_raw.get("config", {})
@@ -41,6 +42,13 @@ def build_transformer_vae_from_checkpoint(
     input_transform = str(train_cfg.get("input_transform", "log1p"))
     use_library_size_covariate = bool(train_cfg.get("use_library_size_covariate", False))
     library_size_covariate_eps = float(train_cfg.get("library_size_covariate_eps", 1e-8))
+
+    max_tokens_per_cell = train_cfg.get("max_tokens_per_cell", None)
+    if max_tokens_per_cell_override is not None:
+        max_tokens_per_cell = int(max_tokens_per_cell_override)
+    min_expr_for_token = float(train_cfg.get("min_expr_for_token", 0.0))
+    if min_expr_for_token_override is not None:
+        min_expr_for_token = float(min_expr_for_token_override)
 
     encoder = TransformerCellEncoder(
         n_genes=n_genes,
@@ -59,8 +67,8 @@ def build_transformer_vae_from_checkpoint(
         transformer_dropout=float(train_cfg.get("transformer_dropout", 0.0)),
         token_mlp_hidden_dim=int(train_cfg.get("token_mlp_hidden_dim", 256)),
         token_mlp_layers=int(train_cfg.get("token_mlp_layers", 2)),
-        max_tokens_per_cell=train_cfg.get("max_tokens_per_cell", None),
-        min_expr_for_token=float(train_cfg.get("min_expr_for_token", 0.0)),
+        max_tokens_per_cell=max_tokens_per_cell,
+        min_expr_for_token=min_expr_for_token,
     )
     decoder = ZINBExpressionDecoder(
         n_genes=n_genes,
@@ -107,6 +115,8 @@ def export_transformer_cell_embeddings(
     num_workers: int = 4,
     device: str = "cuda",
     backed: bool = True,
+    max_tokens_per_cell_override: int | None = None,
+    min_expr_for_token_override: float | None = None,
 ) -> None:
     run_device = torch.device(device)
     if batch_key is not None and cond_key is not None and batch_key != cond_key:
@@ -152,6 +162,8 @@ def export_transformer_cell_embeddings(
         perturbation_dim=perturbation_dim,
         perturb_emb_dim=perturb_emb_dim,
         device=run_device,
+        max_tokens_per_cell_override=max_tokens_per_cell_override,
+        min_expr_for_token_override=min_expr_for_token_override,
     )
     dl = DataLoader(
         ds,
@@ -166,11 +178,13 @@ def export_transformer_cell_embeddings(
     else:
         max_cells = min(int(max_cells), len(ds))
 
-    embeds = []
-    cell_ids = []
-    seen = 0
+    out_path = Path(out_tsv_gz)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with torch.no_grad():
+    seen = 0
+    wrote_header = False
+
+    with torch.inference_mode(), gzip.open(out_path, "wt") as f_out:
         for batch in dl:
             if seen >= max_cells:
                 break
@@ -190,18 +204,18 @@ def export_transformer_cell_embeddings(
             emb_np = mu_z.detach().cpu().numpy()
             bsz = emb_np.shape[0]
             take = min(bsz, max_cells - seen)
-            embeds.append(emb_np[:take])
-            cell_ids.extend(ds.obs_names[seen : seen + take].tolist())
+            if take <= 0:
+                break
+
+            cell_ids = ds.obs_names[seen : seen + take].tolist()
+            df_batch = pd.DataFrame(
+                emb_np[:take],
+                columns=[f"dim_{i+1}" for i in range(emb_np.shape[1])],
+            )
+            df_batch.insert(0, "cell_id", cell_ids)
+            df_batch.to_csv(f_out, sep="\t", index=False, header=not wrote_header)
+            wrote_header = True
             seen += take
-
-    emb_mat = np.concatenate(embeds, axis=0)
-    df = pd.DataFrame(emb_mat, columns=[f"dim_{i+1}" for i in range(emb_mat.shape[1])])
-    df.insert(0, "cell_id", cell_ids)
-
-    out_path = Path(out_tsv_gz)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(out_path, "wt") as f:
-        df.to_csv(f, sep="\t", index=False)
 
     print(f"[export] Wrote Transformer cell embeddings to: {out_path}")
 
@@ -226,6 +240,18 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size (default: 64).")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers (default: 4).")
     parser.add_argument("--device", default="cuda", help="Torch device (default: cuda).")
+    parser.add_argument(
+        "--max-tokens-per-cell-override",
+        type=int,
+        default=None,
+        help="Optional override to cap tokens per cell at export time for lower memory usage.",
+    )
+    parser.add_argument(
+        "--min-expr-for-token-override",
+        type=float,
+        default=None,
+        help="Optional override for tokenization threshold at export time.",
+    )
     parser.add_argument(
         "--backed",
         dest="backed",
@@ -254,6 +280,8 @@ def main() -> None:
         num_workers=args.num_workers,
         device=args.device,
         backed=args.backed,
+        max_tokens_per_cell_override=args.max_tokens_per_cell_override,
+        min_expr_for_token_override=args.min_expr_for_token_override,
     )
 
 
