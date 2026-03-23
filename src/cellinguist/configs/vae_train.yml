@@ -38,6 +38,9 @@ token_mlp_hidden_dim: 256
 token_mlp_layers: 2
 max_tokens_per_cell: null
 min_expr_for_token: 0.0
+transformer_precompute_token_indices: true
+token_index_cache_dir: ""
+token_index_cache_require: true
 
 # loss
 kl_weight: 1.0

@@ -265,7 +265,7 @@ class CBOWCellEncoder(nn.Module):
 
         self.input_transform = input_transform
 
-    def forward(self, x_expr, cond_idx=None, perturb_vec=None):
+    def forward(self, x_expr, cond_idx=None, perturb_vec=None, **kwargs):
         B, G = x_expr.shape
         assert G == self.n_genes
 
@@ -444,6 +444,7 @@ class PerceiverCellEncoder(nn.Module):
         x_expr: torch.Tensor,
         cond_idx: Optional[torch.Tensor] = None,
         perturb_vec: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz, n_genes = x_expr.shape
         if n_genes != self.n_genes:
@@ -610,6 +611,8 @@ class TransformerCellEncoder(nn.Module):
     def _build_token_batch(
         self,
         x_expr: torch.Tensor,
+        token_gene_idx: Optional[torch.Tensor] = None,
+        token_gene_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz, n_genes = x_expr.shape
         if n_genes != self.n_genes:
@@ -619,44 +622,94 @@ class TransformerCellEncoder(nn.Module):
             )
 
         x_tok = self._expr_for_tokens(x_expr)
-        selected_indices: list[torch.Tensor] = []
-        max_seq_len = 1  # CLS only fallback
+        d_model = self.gene_embedding.embedding_dim
 
-        for i in range(bsz):
-            vals_raw = x_expr[i]
-            keep = vals_raw > self.min_expr_for_token
-            idx = torch.nonzero(keep, as_tuple=False).squeeze(-1)
-            if idx.numel() > 0 and self.max_tokens_per_cell is not None and idx.numel() > self.max_tokens_per_cell:
-                vals_keep = vals_raw[idx]
-                topk = torch.topk(vals_keep, k=self.max_tokens_per_cell, largest=True).indices
-                idx = idx[topk]
-            selected_indices.append(idx)
-            seq_len = int(idx.numel()) + 1
-            if seq_len > max_seq_len:
-                max_seq_len = seq_len
+        if token_gene_idx is None:
+            selected_indices: list[torch.Tensor] = []
+            max_seq_len = 1  # CLS only fallback
 
-        tokens = x_expr.new_zeros((bsz, max_seq_len, self.gene_embedding.embedding_dim))
-        key_padding_mask = torch.ones((bsz, max_seq_len), dtype=torch.bool, device=x_expr.device)
+            for i in range(bsz):
+                vals_raw = x_expr[i]
+                keep = vals_raw > self.min_expr_for_token
+                idx = torch.nonzero(keep, as_tuple=False).squeeze(-1)
+                if idx.numel() > 0 and self.max_tokens_per_cell is not None and idx.numel() > self.max_tokens_per_cell:
+                    vals_keep = vals_raw[idx]
+                    topk = torch.topk(vals_keep, k=self.max_tokens_per_cell, largest=True).indices
+                    idx = idx[topk]
+                selected_indices.append(idx)
+                seq_len = int(idx.numel()) + 1
+                if seq_len > max_seq_len:
+                    max_seq_len = seq_len
 
-        cls = self.cls_token.to(dtype=tokens.dtype, device=tokens.device).squeeze(0).squeeze(0)
+            tokens = x_expr.new_zeros((bsz, max_seq_len, d_model))
+            key_padding_mask = torch.ones((bsz, max_seq_len), dtype=torch.bool, device=x_expr.device)
+
+            cls = self.cls_token.to(dtype=tokens.dtype, device=tokens.device).squeeze(0).squeeze(0)
+            cls_pos = self.pos_embedding(
+                torch.tensor([0], dtype=torch.long, device=x_expr.device)
+            ).squeeze(0).to(dtype=tokens.dtype, device=tokens.device)
+
+            for i, idx in enumerate(selected_indices):
+                tokens[i, 0, :] = cls + cls_pos
+                key_padding_mask[i, 0] = False
+                if idx.numel() == 0:
+                    continue
+
+                expr_vals = x_tok[i, idx].unsqueeze(-1).to(dtype=tokens.dtype)
+                gene_emb = self.gene_embedding(idx)
+                gene_pos = self.pos_embedding(idx + 1)
+                token_in = torch.cat([gene_emb, expr_vals], dim=-1)
+                token_vec = self.token_mlp(token_in) + gene_pos
+                seq_len = int(idx.numel())
+                tokens[i, 1 : seq_len + 1, :] = token_vec
+                key_padding_mask[i, 1 : seq_len + 1] = False
+
+            return tokens, key_padding_mask
+
+        token_gene_idx = token_gene_idx.to(device=x_expr.device, dtype=torch.long)
+        if token_gene_mask is None:
+            token_gene_mask = torch.ones_like(token_gene_idx, dtype=torch.bool, device=x_expr.device)
+        else:
+            token_gene_mask = token_gene_mask.to(device=x_expr.device, dtype=torch.bool)
+
+        if token_gene_idx.ndim != 2 or token_gene_mask.ndim != 2:
+            raise ValueError("token_gene_idx and token_gene_mask must have shape (B, L).")
+        if token_gene_idx.shape != token_gene_mask.shape:
+            raise ValueError("token_gene_idx and token_gene_mask must have the same shape.")
+        if token_gene_idx.shape[0] != bsz:
+            raise ValueError("token_gene_idx batch dimension must match x_expr batch size.")
+
+        max_l = int(token_gene_idx.shape[1])
+        if max_l == 0:
+            tokens = x_expr.new_zeros((bsz, 1, d_model))
+            key_padding_mask = torch.zeros((bsz, 1), dtype=torch.bool, device=x_expr.device)
+            cls = self.cls_token.to(dtype=tokens.dtype, device=tokens.device)
+            cls_pos = self.pos_embedding(
+                torch.tensor([0], dtype=torch.long, device=x_expr.device)
+            ).view(1, 1, -1).to(dtype=tokens.dtype, device=tokens.device)
+            tokens[:, :1, :] = cls + cls_pos
+            return tokens, key_padding_mask
+
+        idx_safe = token_gene_idx.clamp(min=0, max=self.n_genes - 1)
+        expr_vals = torch.gather(x_tok, 1, idx_safe).unsqueeze(-1)
+        gene_emb = self.gene_embedding(idx_safe)
+        pos_emb = self.pos_embedding(idx_safe + 1)
+        token_in = torch.cat([gene_emb, expr_vals.to(dtype=gene_emb.dtype)], dim=-1)
+
+        flat = token_in.view(-1, token_in.shape[-1])
+        token_vec = self.token_mlp(flat).view(bsz, max_l, d_model) + pos_emb
+        token_vec = token_vec * token_gene_mask.unsqueeze(-1).to(dtype=token_vec.dtype)
+
+        tokens = x_expr.new_zeros((bsz, max_l + 1, d_model))
+        key_padding_mask = torch.ones((bsz, max_l + 1), dtype=torch.bool, device=x_expr.device)
+        cls = self.cls_token.to(dtype=tokens.dtype, device=tokens.device)
         cls_pos = self.pos_embedding(
             torch.tensor([0], dtype=torch.long, device=x_expr.device)
-        ).squeeze(0).to(dtype=tokens.dtype, device=tokens.device)
-
-        for i, idx in enumerate(selected_indices):
-            tokens[i, 0, :] = cls + cls_pos
-            key_padding_mask[i, 0] = False
-            if idx.numel() == 0:
-                continue
-
-            expr_vals = x_tok[i, idx].unsqueeze(-1).to(dtype=tokens.dtype)
-            gene_emb = self.gene_embedding(idx)
-            gene_pos = self.pos_embedding(idx + 1)
-            token_in = torch.cat([gene_emb, expr_vals], dim=-1)
-            token_vec = self.token_mlp(token_in) + gene_pos
-            seq_len = int(idx.numel())
-            tokens[i, 1 : seq_len + 1, :] = token_vec
-            key_padding_mask[i, 1 : seq_len + 1] = False
+        ).view(1, 1, -1).to(dtype=tokens.dtype, device=tokens.device)
+        tokens[:, :1, :] = cls + cls_pos
+        tokens[:, 1:, :] = token_vec
+        key_padding_mask[:, 0] = False
+        key_padding_mask[:, 1:] = ~token_gene_mask
 
         return tokens, key_padding_mask
 
@@ -665,8 +718,15 @@ class TransformerCellEncoder(nn.Module):
         x_expr: torch.Tensor,
         cond_idx: Optional[torch.Tensor] = None,
         perturb_vec: Optional[torch.Tensor] = None,
+        token_gene_idx: Optional[torch.Tensor] = None,
+        token_gene_mask: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        tokens, key_padding_mask = self._build_token_batch(x_expr)
+        tokens, key_padding_mask = self._build_token_batch(
+            x_expr,
+            token_gene_idx=token_gene_idx,
+            token_gene_mask=token_gene_mask,
+        )
         hidden = self.transformer(tokens, src_key_padding_mask=key_padding_mask)
         h_cell = self.final_norm(hidden[:, 0, :])
 
@@ -805,8 +865,9 @@ class GeneVAE(nn.Module):
         x_expr: torch.Tensor,
         cond_idx: Optional[torch.Tensor] = None,
         perturb_vec: Optional[torch.Tensor] = None,
+        **encoder_kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.encoder(x_expr, cond_idx, perturb_vec=perturb_vec)
+        return self.encoder(x_expr, cond_idx, perturb_vec=perturb_vec, **encoder_kwargs)
 
     @staticmethod
     def reparameterize(
@@ -832,6 +893,7 @@ class GeneVAE(nn.Module):
         cond_idx: Optional[torch.Tensor] = None,
         libsize: Optional[torch.Tensor] = None,
         perturb_vec: Optional[torch.Tensor] = None,
+        **encoder_kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns
@@ -840,7 +902,12 @@ class GeneVAE(nn.Module):
         mu : (B, latent_dim)
         logvar : (B, latent_dim)
         """
-        mu, logvar = self.encode(x_expr, cond_idx, perturb_vec=perturb_vec)
+        mu, logvar = self.encode(
+            x_expr,
+            cond_idx,
+            perturb_vec=perturb_vec,
+            **encoder_kwargs,
+        )
         z = self.reparameterize(mu, logvar)
         recon_x = self.decode(z, cond_idx, libsize=libsize, perturb_vec=perturb_vec)
         return recon_x, mu, logvar

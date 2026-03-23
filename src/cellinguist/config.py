@@ -116,6 +116,9 @@ class VAETrainConfig:
     token_mlp_layers: int = 2
     max_tokens_per_cell: Optional[int] = None
     min_expr_for_token: float = 0.0
+    transformer_precompute_token_indices: bool = True
+    token_index_cache_dir: str = ""
+    token_index_cache_require: bool = True
 
     kl_weight: float = 1.0
     use_metric_loss: bool = False

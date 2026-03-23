@@ -17,6 +17,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from cellinguist.config import VAETrainConfig, load_yaml
 from cellinguist.data.datasets import SingleCellVAEDataset
+from cellinguist.data.dataloaders import collate_vae_batch
 from cellinguist.models.vae import (
     CBOWCellEncoder,
     PerceiverCellEncoder,
@@ -128,6 +129,10 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 f"Unsupported encoder_type: {cfg.encoder_type}. Use 'cbow', 'perceiver', or 'transformer'."
             )
         _log(rank, f"encoder_type={encoder_type}")
+        if encoder_type == "transformer" and cfg.token_index_cache_require and not cfg.token_index_cache_dir:
+            raise ValueError(
+                "encoder_type='transformer' with token_index_cache_require=True requires token_index_cache_dir."
+            )
         if cfg.use_metric_loss:
             if cfg.metric_loss_weight < 0:
                 raise ValueError("metric_loss_weight must be >= 0.")
@@ -224,6 +229,15 @@ def train_vae(cfg: VAETrainConfig) -> str:
                     "[VAE] WARNING: use_library_size_covariate=True with library_norm!='none'. "
                     "For a pure covariate strategy, set library_norm='none'."
                 )
+            transformer_cache_dir = ""
+            if encoder_type == "transformer":
+                transformer_cache_dir = str(cfg.token_index_cache_dir or "")
+            use_transformer_in_memory_precompute = (
+                encoder_type == "transformer"
+                and (not transformer_cache_dir)
+                and cfg.transformer_precompute_token_indices
+            )
+
             vae_dataset = SingleCellVAEDataset(
                 adata_or_path=cfg.adata_path,
                 gene_key=cfg.gene_key,
@@ -236,6 +250,13 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 cytokine_missing_policy=cfg.cytokine_missing_policy,
                 transform="none",
                 backed=cfg.backed,
+                precompute_token_gene_indices=use_transformer_in_memory_precompute,
+                token_min_expr=cfg.min_expr_for_token,
+                token_max_genes=cfg.max_tokens_per_cell,
+                token_index_cache_dir=(transformer_cache_dir if encoder_type == "transformer" else None),
+                token_index_cache_require=(
+                    encoder_type == "transformer" and bool(cfg.token_index_cache_require)
+                ),
             )
             genes_common = vae_dataset.gene_order
             n_cells, n_genes = vae_dataset.n_cells, vae_dataset.n_genes
@@ -414,6 +435,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
             num_workers=effective_num_workers,
             pin_memory=(device.type == "cuda"),
             persistent_workers=effective_num_workers > 0,
+            collate_fn=collate_vae_batch,
         )
         _log(rank, f"dataloader ready: batch_size={cfg.batch_size} num_workers={effective_num_workers}")
 
@@ -426,6 +448,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 num_workers=effective_num_workers,
                 pin_memory=(device.type == "cuda"),
                 persistent_workers=effective_num_workers > 0,
+                collate_fn=collate_vae_batch,
             )
 
         ckpt_dir = Path(cfg.checkpoint_dir)
@@ -524,11 +547,20 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 if perturb_vec is not None:
                     perturb_vec = perturb_vec.to(device, non_blocking=True)
 
+                token_gene_idx = batch.get("token_gene_idx", None)
+                token_gene_mask = batch.get("token_gene_mask", None)
+                if token_gene_idx is not None:
+                    token_gene_idx = token_gene_idx.to(device, non_blocking=True)
+                if token_gene_mask is not None:
+                    token_gene_mask = token_gene_mask.to(device, non_blocking=True)
+
                 recon_out, mu_z, logvar_z = model(
                     x,
                     batch_idx,
                     libsize=libsize,
                     perturb_vec=perturb_vec,
+                    token_gene_idx=token_gene_idx,
+                    token_gene_mask=token_gene_mask,
                 )
                 mu, theta, pi = recon_out
 
@@ -605,11 +637,20 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 if perturb_vec is not None:
                     perturb_vec = perturb_vec.to(device, non_blocking=True)
 
+                token_gene_idx = batch.get("token_gene_idx", None)
+                token_gene_mask = batch.get("token_gene_mask", None)
+                if token_gene_idx is not None:
+                    token_gene_idx = token_gene_idx.to(device, non_blocking=True)
+                if token_gene_mask is not None:
+                    token_gene_mask = token_gene_mask.to(device, non_blocking=True)
+
                 recon_out, mu_z, logvar_z = model(
                     x,
                     batch_idx,
                     libsize=libsize,
                     perturb_vec=perturb_vec,
+                    token_gene_idx=token_gene_idx,
+                    token_gene_mask=token_gene_mask,
                 )
                 mu, theta, pi = recon_out
 
@@ -688,11 +729,20 @@ def train_vae(cfg: VAETrainConfig) -> str:
                         if perturb_vec is not None:
                             perturb_vec = perturb_vec.to(device, non_blocking=True)
 
+                        token_gene_idx = batch.get("token_gene_idx", None)
+                        token_gene_mask = batch.get("token_gene_mask", None)
+                        if token_gene_idx is not None:
+                            token_gene_idx = token_gene_idx.to(device, non_blocking=True)
+                        if token_gene_mask is not None:
+                            token_gene_mask = token_gene_mask.to(device, non_blocking=True)
+
                         recon_out, _, _ = model(
                             x,
                             batch_idx,
                             libsize=libsize,
                             perturb_vec=perturb_vec,
+                            token_gene_idx=token_gene_idx,
+                            token_gene_mask=token_gene_mask,
                         )
                         mu, theta, pi = recon_out
                         recon = zinb_negative_log_likelihood(x, mu, theta, pi, reduction="mean")

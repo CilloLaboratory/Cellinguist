@@ -35,6 +35,35 @@ train-cbow --config cbow_config.yml
 
 An example config file can be found in the configs directory of this repository.
 
+## Transformer Token Index Cache (Recommended for Large Datasets)
+
+For large transformer runs (especially DDP), precompute token gene indices once on CPU and reuse them across all GPU ranks.
+
+1. Precompute cache:
+
+```
+precompute-transformer-token-indices \
+  --adata /path/to/data.h5ad \
+  --out-dir /path/to/token_cache \
+  --gene-key gene \
+  --min-expr-for-token 0.0 \
+  --max-tokens-per-cell 256 \
+  --shard-size-cells 100000 \
+  --num-workers 16
+```
+
+2. Train with transformer using the cache:
+
+Set in `vae_train.yml`:
+
+```
+encoder_type: "transformer"
+token_index_cache_dir: "/path/to/token_cache"
+token_index_cache_require: true
+```
+
+Then launch training (single GPU or torchrun DDP as usual).
+
 ## VAE Training
 Singe-GPU training:
 

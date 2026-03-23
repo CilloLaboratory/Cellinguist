@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from bisect import bisect_right
+from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -34,9 +36,16 @@ from collections import Counter
 
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
+from bisect import bisect_right
+from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+from cellinguist.utils.token_index_cache import (
+    load_cache_metadata,
+    validate_cache_metadata,
+)
 
 
 @dataclass
@@ -342,6 +351,22 @@ class SingleCellDataset(Dataset):
     # Public API
     # -------------------------------------------------------------------------
 
+    def _build_token_gene_indices(self) -> list[np.ndarray]:
+        token_indices: list[np.ndarray] = []
+        max_genes = self.token_max_genes
+
+        for i in range(self.n_cells):
+            x_raw = self._get_row(i, apply_transform=False)
+            idx = np.where(x_raw > self.token_min_expr)[0]
+            if idx.size > 0 and max_genes is not None and idx.size > max_genes:
+                vals = x_raw[idx]
+                part = np.argpartition(vals, -max_genes)[-max_genes:]
+                idx = idx[part]
+            token_indices.append(idx.astype(np.int64, copy=False))
+
+        return token_indices
+
+
     def __len__(self) -> int:
         return len(self._cells)
 
@@ -466,6 +491,22 @@ class CBOWPairsDataset(Dataset):
                 valid.append(i)
         return np.asarray(valid, dtype=np.int64)
 
+    def _build_token_gene_indices(self) -> list[np.ndarray]:
+        token_indices: list[np.ndarray] = []
+        max_genes = self.token_max_genes
+
+        for i in range(self.n_cells):
+            x_raw = self._get_row(i, apply_transform=False)
+            idx = np.where(x_raw > self.token_min_expr)[0]
+            if idx.size > 0 and max_genes is not None and idx.size > max_genes:
+                vals = x_raw[idx]
+                part = np.argpartition(vals, -max_genes)[-max_genes:]
+                idx = idx[part]
+            token_indices.append(idx.astype(np.int64, copy=False))
+
+        return token_indices
+
+
     def __len__(self) -> int:
         """
         Logical dataset length is n_cells * samples_per_cell.
@@ -576,6 +617,11 @@ class SingleCellVAEDataset(Dataset):
         gene_order: Optional[list[str]] = None,
         transform: str = "log1p",
         backed: bool = True,
+        precompute_token_gene_indices: bool = False,
+        token_min_expr: float = 0.0,
+        token_max_genes: Optional[int] = None,
+        token_index_cache_dir: Optional[str] = None,
+        token_index_cache_require: bool = False,
     ) -> None:
         super().__init__()
         self.layer = layer
@@ -602,6 +648,18 @@ class SingleCellVAEDataset(Dataset):
             )
         self._backed = bool(backed)
         self._adata = None
+        self.precompute_token_gene_indices = bool(precompute_token_gene_indices)
+        self.token_min_expr = float(token_min_expr)
+        self.token_max_genes = None if token_max_genes is None else int(token_max_genes)
+        if self.token_max_genes is not None and self.token_max_genes <= 0:
+            raise ValueError("token_max_genes must be > 0 when provided.")
+        self._token_gene_indices: Optional[list[np.ndarray]] = None
+        self.token_index_cache_dir = str(token_index_cache_dir) if token_index_cache_dir else ""
+        self.token_index_cache_require = bool(token_index_cache_require)
+        self._token_cache_meta: Optional[dict[str, Any]] = None
+        self._token_cache_shards: list[dict[str, Any]] = []
+        self._token_cache_starts: list[int] = []
+        self._token_cache_memmaps: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
         if isinstance(adata_or_path, ad.AnnData):
             self._adata = adata_or_path
@@ -713,6 +771,19 @@ class SingleCellVAEDataset(Dataset):
         ):
             adata_probe.file.close()
 
+        if self.token_index_cache_dir:
+            adata_path_for_fp = self._adata_path if isinstance(adata_or_path, str) else None
+            self._init_token_index_cache(
+                adata_path_for_fingerprint=adata_path_for_fp,
+                gene_key=gene_key,
+            )
+        elif self.token_index_cache_require:
+            raise ValueError(
+                "token_index_cache_require=True but token_index_cache_dir was not provided."
+            )
+        elif self.precompute_token_gene_indices:
+            self._token_gene_indices = self._build_token_gene_indices()
+
     def _ensure_adata(self):
         if self._adata is not None:
             return self._adata
@@ -741,6 +812,106 @@ class SingleCellVAEDataset(Dataset):
             x = np.log1p(x)
         return x
 
+    def _build_token_gene_indices(self) -> list[np.ndarray]:
+        token_indices: list[np.ndarray] = []
+        max_genes = self.token_max_genes
+
+        for i in range(self.n_cells):
+            x_raw = self._get_row(i, apply_transform=False)
+            idx = np.where(x_raw > self.token_min_expr)[0]
+            if idx.size > 0 and max_genes is not None and idx.size > max_genes:
+                vals = x_raw[idx]
+                part = np.argpartition(vals, -max_genes)[-max_genes:]
+                idx = idx[part]
+            token_indices.append(idx.astype(np.int64, copy=False))
+
+        return token_indices
+
+    def _init_token_index_cache(
+        self,
+        adata_path_for_fingerprint: Optional[str],
+        gene_key: str,
+    ) -> None:
+        cache_dir = Path(self.token_index_cache_dir).resolve()
+        meta = load_cache_metadata(cache_dir)
+        validate_cache_metadata(
+            meta,
+            n_cells=self.n_cells,
+            n_genes=self.n_genes,
+            gene_order=self.gene_order,
+            min_expr_for_token=self.token_min_expr,
+            max_tokens_per_cell=self.token_max_genes,
+            adata_path=adata_path_for_fingerprint,
+            gene_key=gene_key,
+        )
+
+        shards_in = meta.get("shards", [])
+        shards: list[dict[str, Any]] = []
+        starts: list[int] = []
+
+        for sh in shards_in:
+            cell_start = int(sh["cell_start"])
+            cell_end = int(sh["cell_end"])
+            idx_path = (cache_dir / str(sh["indices_file"])).resolve()
+            off_path = (cache_dir / str(sh["offsets_file"])).resolve()
+            if not idx_path.exists():
+                raise FileNotFoundError(f"Missing token index shard file: {idx_path}")
+            if not off_path.exists():
+                raise FileNotFoundError(f"Missing token offset shard file: {off_path}")
+            shards.append(
+                {
+                    "cell_start": cell_start,
+                    "cell_end": cell_end,
+                    "indices_path": str(idx_path),
+                    "offsets_path": str(off_path),
+                }
+            )
+            starts.append(cell_start)
+
+        shards.sort(key=lambda x: int(x["cell_start"]))
+        starts = [int(s["cell_start"]) for s in shards]
+
+        expected = 0
+        for sh in shards:
+            if int(sh["cell_start"]) != expected:
+                raise ValueError(
+                    "Token cache shards are not contiguous from cell 0. "
+                    f"Expected start={expected}, got {int(sh['cell_start'])}."
+                )
+            expected = int(sh["cell_end"])
+        if expected != int(self.n_cells):
+            raise ValueError(
+                "Token cache shards do not cover all cells. "
+                f"Covered={expected}, n_cells={self.n_cells}."
+            )
+
+        self._token_cache_meta = meta
+        self._token_cache_shards = shards
+        self._token_cache_starts = starts
+        self._token_cache_memmaps = {}
+
+    def _get_cached_token_gene_indices(self, idx: int) -> np.ndarray:
+        if not self._token_cache_shards:
+            raise RuntimeError("Token cache is not initialized.")
+
+        shard_idx = bisect_right(self._token_cache_starts, int(idx)) - 1
+        if shard_idx < 0:
+            raise IndexError(f"Cell index out of token cache range: {idx}")
+        sh = self._token_cache_shards[shard_idx]
+        if int(idx) >= int(sh["cell_end"]):
+            raise IndexError(f"Cell index out of token cache shard range: {idx}")
+
+        if shard_idx not in self._token_cache_memmaps:
+            idx_mm = np.load(str(sh["indices_path"]), mmap_mode="r")
+            off_mm = np.load(str(sh["offsets_path"]), mmap_mode="r")
+            self._token_cache_memmaps[shard_idx] = (idx_mm, off_mm)
+
+        idx_mm, off_mm = self._token_cache_memmaps[shard_idx]
+        local = int(idx) - int(sh["cell_start"])
+        start = int(off_mm[local])
+        end = int(off_mm[local + 1])
+        return np.asarray(idx_mm[start:end], dtype=np.int64)
+
     def __len__(self) -> int:
         return self.n_cells
 
@@ -759,6 +930,10 @@ class SingleCellVAEDataset(Dataset):
             out["cond_idx"] = b
         if self._perturb_matrix is not None:
             out["perturb_vec"] = torch.from_numpy(self._perturb_matrix[idx])
+        if self._token_cache_shards:
+            out["token_gene_idx"] = torch.from_numpy(self._get_cached_token_gene_indices(idx))
+        elif self._token_gene_indices is not None:
+            out["token_gene_idx"] = torch.from_numpy(self._token_gene_indices[idx])
         return out
 
     def get_perturb_matrix(self) -> Optional[np.ndarray]:
@@ -774,6 +949,7 @@ class SingleCellVAEDataset(Dataset):
         state = dict(self.__dict__)
         if self._adata_path is not None:
             state["_adata"] = None
+        state["_token_cache_memmaps"] = {}
         return state
 
     def __del__(self):
