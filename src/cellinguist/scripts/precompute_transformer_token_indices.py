@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -53,7 +54,20 @@ def _load_gene_order_source(path: str) -> list[str]:
 class _ShardTask:
     shard_id: int
     adata_path: str
-    out_dir: str
+    cell_start: int
+    cell_end: int
+    layer: Optional[str]
+    gene_indices: Optional[np.ndarray]
+    min_expr_for_token: float
+    max_tokens_per_cell: Optional[int]
+
+
+@dataclass
+class _ChunkTask:
+    shard_id: int
+    chunk_id: int
+    adata_path: str
+    tmp_dir: str
     cell_start: int
     cell_end: int
     layer: Optional[str]
@@ -74,7 +88,7 @@ def _read_row(adata, layer: Optional[str], idx: int) -> np.ndarray:
     return x.astype(np.float32, copy=False)
 
 
-def _build_single_shard(task: _ShardTask) -> dict:
+def _build_single_chunk(task: _ChunkTask) -> dict:
     adata = ad.read_h5ad(task.adata_path, backed="r")
     try:
         offsets = [0]
@@ -99,23 +113,84 @@ def _build_single_shard(task: _ShardTask) -> dict:
         indices = np.concatenate(idx_chunks, axis=0) if idx_chunks else np.zeros((0,), dtype=np.int32)
         offsets_arr = np.asarray(offsets, dtype=np.int64)
 
-        out_dir = Path(task.out_dir)
-        idx_name = f"indices_{task.shard_id:05d}.npy"
-        off_name = f"offsets_{task.shard_id:05d}.npy"
-        np.save(out_dir / idx_name, indices)
-        np.save(out_dir / off_name, offsets_arr)
+        out_dir = Path(task.tmp_dir)
+        idx_name = f"indices_s{task.shard_id:05d}_c{task.chunk_id:05d}.npy"
+        off_name = f"offsets_s{task.shard_id:05d}_c{task.chunk_id:05d}.npy"
+        np.save(out_dir / idx_name, indices, allow_pickle=False)
+        np.save(out_dir / off_name, offsets_arr, allow_pickle=False)
 
         return {
             "shard_id": int(task.shard_id),
+            "chunk_id": int(task.chunk_id),
             "cell_start": int(task.cell_start),
             "cell_end": int(task.cell_end),
             "indices_file": idx_name,
             "offsets_file": off_name,
-            "n_tokens": int(indices.size),
+            "n_tokens_chunk": int(indices.size),
         }
     finally:
         if getattr(adata, "isbacked", False):
             adata.file.close()
+
+
+def _merge_shard_chunks(
+    *,
+    shard_id: int,
+    chunk_meta: list[dict],
+    out_dir: Path,
+    tmp_dir: Path,
+) -> dict:
+    idx_parts: list[np.ndarray] = []
+    off_parts: list[np.ndarray] = []
+    cell_start = int(chunk_meta[0]["cell_start"])
+    cell_end = int(chunk_meta[-1]["cell_end"])
+
+    for ch in chunk_meta:
+        idx_arr = np.load(tmp_dir / str(ch["indices_file"]), mmap_mode="r")
+        off_arr = np.load(tmp_dir / str(ch["offsets_file"]), mmap_mode="r")
+        idx_np = np.asarray(idx_arr, dtype=np.int32)
+        off_np = np.asarray(off_arr, dtype=np.int64)
+        if off_np.ndim != 1 or off_np.size < 1:
+            raise ValueError(
+                f"Invalid offsets array in chunk shard={shard_id} chunk={int(ch['chunk_id'])}."
+            )
+        idx_parts.append(idx_np)
+        off_parts.append(off_np)
+
+    if idx_parts:
+        merged_idx = np.concatenate(idx_parts, axis=0)
+    else:
+        merged_idx = np.zeros((0,), dtype=np.int32)
+
+    offsets_out = np.empty((1 + sum(int(o.size - 1) for o in off_parts),), dtype=np.int64)
+    offsets_out[0] = 0
+    write_pos = 1
+    running = 0
+    for off in off_parts:
+        seg_len = int(off.size - 1)
+        if seg_len > 0:
+            offsets_out[write_pos : write_pos + seg_len] = off[1:] + running
+            write_pos += seg_len
+        running += int(off[-1])
+    n_tokens = int(running)
+
+    idx_name = f"indices_{shard_id:05d}.npy"
+    off_name = f"offsets_{shard_id:05d}.npy"
+    np.save(out_dir / idx_name, merged_idx, allow_pickle=False)
+    np.save(out_dir / off_name, offsets_out, allow_pickle=False)
+
+    for ch in chunk_meta:
+        (tmp_dir / str(ch["indices_file"])).unlink(missing_ok=True)
+        (tmp_dir / str(ch["offsets_file"])).unlink(missing_ok=True)
+
+    return {
+        "shard_id": int(shard_id),
+        "cell_start": int(cell_start),
+        "cell_end": int(cell_end),
+        "indices_file": idx_name,
+        "offsets_file": off_name,
+        "n_tokens": int(n_tokens),
+    }
 
 
 def precompute_token_index_cache(
@@ -128,15 +203,20 @@ def precompute_token_index_cache(
     min_expr_for_token: float = 0.0,
     max_tokens_per_cell: Optional[int] = None,
     shard_size_cells: int = 100000,
+    work_chunk_cells: Optional[int] = None,
     num_workers: int = 8,
 ) -> dict:
     if shard_size_cells <= 0:
         raise ValueError("shard_size_cells must be > 0")
+    if work_chunk_cells is not None and int(work_chunk_cells) <= 0:
+        raise ValueError("work_chunk_cells must be > 0 when provided")
     if max_tokens_per_cell is not None and int(max_tokens_per_cell) <= 0:
         raise ValueError("max_tokens_per_cell must be > 0 when provided")
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    tmp_dir = out / "_tmp_chunks"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
     adata_probe = ad.read_h5ad(adata_path, backed="r")
     try:
@@ -173,15 +253,14 @@ def precompute_token_index_cache(
         if getattr(adata_probe, "isbacked", False):
             adata_probe.file.close()
 
-    tasks = []
+    shard_tasks: list[_ShardTask] = []
     shard_id = 0
     for cell_start in range(0, n_cells, shard_size_cells):
         cell_end = min(cell_start + shard_size_cells, n_cells)
-        tasks.append(
+        shard_tasks.append(
             _ShardTask(
                 shard_id=shard_id,
                 adata_path=str(adata_path),
-                out_dir=str(out),
                 cell_start=int(cell_start),
                 cell_end=int(cell_end),
                 layer=layer,
@@ -192,17 +271,64 @@ def precompute_token_index_cache(
         )
         shard_id += 1
 
-    workers = max(1, int(num_workers))
-    if workers == 1:
-        shard_meta = [_build_single_shard(t) for t in tasks]
-    else:
-        shard_meta = []
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            futs = [ex.submit(_build_single_shard, t) for t in tasks]
-            for f in as_completed(futs):
-                shard_meta.append(f.result())
+    chunk_size = int(work_chunk_cells) if work_chunk_cells is not None else int(shard_size_cells)
+    chunk_tasks: list[_ChunkTask] = []
+    for st in shard_tasks:
+        chunk_id = 0
+        for cs in range(int(st.cell_start), int(st.cell_end), chunk_size):
+            ce = min(cs + chunk_size, int(st.cell_end))
+            chunk_tasks.append(
+                _ChunkTask(
+                    shard_id=int(st.shard_id),
+                    chunk_id=int(chunk_id),
+                    adata_path=st.adata_path,
+                    tmp_dir=str(tmp_dir),
+                    cell_start=int(cs),
+                    cell_end=int(ce),
+                    layer=st.layer,
+                    gene_indices=st.gene_indices,
+                    min_expr_for_token=st.min_expr_for_token,
+                    max_tokens_per_cell=st.max_tokens_per_cell,
+                )
+            )
+            chunk_id += 1
 
-    shard_meta.sort(key=lambda x: int(x["shard_id"]))
+    requested_workers = max(1, int(num_workers))
+    effective_workers = min(requested_workers, max(1, len(chunk_tasks)))
+    print(
+        "[token-cache] build plan "
+        f"n_cells={n_cells} shard_size_cells={int(shard_size_cells)} work_chunk_cells={chunk_size} "
+        f"n_tasks={len(chunk_tasks)} "
+        f"requested_workers={requested_workers} effective_workers={effective_workers}"
+    )
+
+    try:
+        if effective_workers == 1:
+            chunk_meta = [_build_single_chunk(t) for t in chunk_tasks]
+        else:
+            chunk_meta = []
+            with ProcessPoolExecutor(max_workers=effective_workers) as ex:
+                futs = [ex.submit(_build_single_chunk, t) for t in chunk_tasks]
+                for f in as_completed(futs):
+                    chunk_meta.append(f.result())
+
+        by_shard: dict[int, list[dict]] = {}
+        for m in chunk_meta:
+            sid = int(m["shard_id"])
+            by_shard.setdefault(sid, []).append(m)
+
+        shard_meta: list[dict] = []
+        for sid in sorted(by_shard):
+            chunk_list = sorted(by_shard[sid], key=lambda x: int(x["chunk_id"]))
+            merged = _merge_shard_chunks(
+                shard_id=int(sid),
+                chunk_meta=chunk_list,
+                out_dir=out,
+                tmp_dir=tmp_dir,
+            )
+            shard_meta.append(merged)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     adata_fp = compute_adata_fingerprint(str(adata_path), gene_key=gene_key)
     gene_order_hash = compute_gene_order_hash(gene_order)
@@ -221,7 +347,9 @@ def precompute_token_index_cache(
         "min_expr_for_token": float(min_expr_for_token),
         "max_tokens_per_cell": None if max_tokens_per_cell is None else int(max_tokens_per_cell),
         "shard_size_cells": int(shard_size_cells),
-        "num_workers": int(workers),
+        "work_chunk_cells": int(chunk_size),
+        "num_workers": int(effective_workers),
+        "requested_num_workers": int(requested_workers),
         "gene_order_source": gene_order_source,
         "shards": [
             {
@@ -288,6 +416,15 @@ def main() -> None:
         help="Number of cells per shard file (default: 100000).",
     )
     ap.add_argument(
+        "--work-chunk-cells",
+        type=int,
+        default=None,
+        help=(
+            "CPU preprocessing chunk size per task. Defaults to shard-size-cells; "
+            "set smaller than shard-size-cells to increase task parallelism."
+        ),
+    )
+    ap.add_argument(
         "--num-workers",
         type=int,
         default=max(1, (os.cpu_count() or 1) // 2),
@@ -304,6 +441,7 @@ def main() -> None:
         min_expr_for_token=args.min_expr_for_token,
         max_tokens_per_cell=args.max_tokens_per_cell,
         shard_size_cells=args.shard_size_cells,
+        work_chunk_cells=args.work_chunk_cells,
         num_workers=args.num_workers,
     )
 

@@ -65,6 +65,29 @@ def test_precompute_cache_writes_expected_files(tmp_path: Path) -> None:
         assert int(indices.max()) < 4
 
 
+def test_precompute_cache_uses_work_chunks_independent_of_shards(tmp_path: Path) -> None:
+    h5ad_path = _write_tiny_h5ad(tmp_path)
+    out_dir = tmp_path / "cache_chunks"
+
+    meta = precompute_token_index_cache(
+        adata_path=str(h5ad_path),
+        out_dir=str(out_dir),
+        gene_key="gene",
+        min_expr_for_token=0.0,
+        max_tokens_per_cell=None,
+        shard_size_cells=4,
+        work_chunk_cells=1,
+        num_workers=4,
+    )
+
+    assert len(meta["shards"]) == 1
+    assert int(meta["requested_num_workers"]) == 4
+    assert int(meta["num_workers"]) >= 2
+    assert int(meta["work_chunk_cells"]) == 1
+    assert (out_dir / "indices_00000.npy").exists()
+    assert (out_dir / "offsets_00000.npy").exists()
+
+
 def test_dataset_cache_matches_in_memory_precompute(tmp_path: Path) -> None:
     h5ad_path = _write_tiny_h5ad(tmp_path)
     out_dir = tmp_path / "cache"

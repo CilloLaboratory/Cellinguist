@@ -49,6 +49,7 @@ precompute-transformer-token-indices \
   --min-expr-for-token 0.0 \
   --max-tokens-per-cell 256 \
   --shard-size-cells 100000 \
+  --work-chunk-cells 5000 \
   --num-workers 16
 ```
 
@@ -63,6 +64,8 @@ token_index_cache_require: true
 ```
 
 Then launch training (single GPU or torchrun DDP as usual).
+
+Tip: use fewer, larger shard files for training I/O efficiency, and use `--work-chunk-cells` to increase CPU preprocessing parallelism without increasing shard count.
 
 ## VAE Training
 Singe-GPU training:
