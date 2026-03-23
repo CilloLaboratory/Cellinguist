@@ -227,3 +227,56 @@ def test_train_vae_transformer_cache_required_and_smoke(tmp_path: Path) -> None:
     )
     ckpt_path = train_vae(cfg_ok)
     assert Path(ckpt_path).exists()
+
+
+def test_train_vae_transformer_cache_data_mean_smoke(tmp_path: Path) -> None:
+    h5ad_path = _write_tiny_h5ad(tmp_path)
+    cache_dir = tmp_path / "cache_data_mean"
+    precompute_token_index_cache(
+        adata_path=str(h5ad_path),
+        out_dir=str(cache_dir),
+        gene_key="gene",
+        min_expr_for_token=0.0,
+        max_tokens_per_cell=None,
+        shard_size_cells=2,
+        num_workers=1,
+    )
+
+    cfg = VAETrainConfig(
+        adata_path=str(h5ad_path),
+        gene_key="gene",
+        encoder_type="transformer",
+        latent_dim=4,
+        hidden_dim=8,
+        n_hidden_layers=1,
+        cond_emb_dim=4,
+        input_transform="none",
+        transformer_d_model=8,
+        transformer_n_heads=2,
+        transformer_n_layers=1,
+        transformer_ff_mult=2,
+        transformer_dropout=0.0,
+        token_mlp_hidden_dim=8,
+        token_mlp_layers=1,
+        min_expr_for_token=0.0,
+        max_tokens_per_cell=None,
+        transformer_precompute_token_indices=False,
+        token_index_cache_dir=str(cache_dir),
+        token_index_cache_require=True,
+        perturbation_mode="none",
+        lr=1e-3,
+        weight_decay=0.0,
+        batch_size=2,
+        epochs=1,
+        num_workers=0,
+        device="cpu",
+        decoder_mu_init="data_mean",
+        decoder_init_n_cells=4,
+        decoder_init_batch_size=2,
+        decoder_init_num_workers=0,
+        checkpoint_dir=str(tmp_path / "ckpt_data_mean"),
+        run_name="data_mean",
+        save_every=1,
+    )
+    ckpt_path = train_vae(cfg)
+    assert Path(ckpt_path).exists()

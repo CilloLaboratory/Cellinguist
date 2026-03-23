@@ -195,13 +195,17 @@ def estimate_gene_means(
     if n <= 0:
         raise ValueError("Dataset is empty; cannot estimate gene means.")
 
-    # Deterministic order; do NOT shuffle for reproducibility
+    # Deterministic order; do NOT shuffle for reproducibility.
+    # Use VAE collate to handle variable-length token_gene_idx tensors (transformer cache mode).
+    from cellinguist.data.dataloaders import collate_vae_batch
+
     dl = DataLoader(
         dataset,
         batch_size=int(batch_size),
         shuffle=False,
         num_workers=int(num_workers),
         pin_memory=bool(pin_memory),
+        collate_fn=collate_vae_batch,
     )
 
     sum_x: Optional[torch.Tensor] = None
