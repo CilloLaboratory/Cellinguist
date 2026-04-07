@@ -152,6 +152,16 @@ def train_vae(cfg: VAETrainConfig) -> str:
             raise ValueError("runin_metric_weight must be >= 0.")
         if cfg.batch_invariance_method not in {"none", "adversarial"}:
             raise ValueError("batch_invariance_method must be 'none' or 'adversarial'.")
+        if cfg.batch_correction_method not in {"none", "mean_scale"}:
+            raise ValueError("batch_correction_method must be 'none' or 'mean_scale'.")
+        if cfg.batch_correction_eps <= 0:
+            raise ValueError("batch_correction_eps must be > 0.")
+        if cfg.batch_correction_clip_min <= 0:
+            raise ValueError("batch_correction_clip_min must be > 0.")
+        if cfg.batch_correction_clip_max < cfg.batch_correction_clip_min:
+            raise ValueError(
+                "batch_correction_clip_max must be >= batch_correction_clip_min."
+            )
         if cfg.batch_invariance_weight < 0:
             raise ValueError("batch_invariance_weight must be >= 0.")
         if cfg.batch_adv_grl_lambda <= 0:
@@ -178,6 +188,10 @@ def train_vae(cfg: VAETrainConfig) -> str:
             raise ValueError(
                 "perturbation_mode='categorical' requires batch_key/cond_key."
             )
+        if cfg.batch_correction_method != "none" and effective_batch_key is None:
+            raise ValueError(
+                "batch_correction_method requires batch_key/cond_key."
+            )
 
         if encoder_type == "cbow":
             if not cfg.gene_emb_tsv:
@@ -190,6 +204,10 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 layer=cfg.layer,
                 cond_key=effective_batch_key,
                 batch_key=effective_batch_key,
+                batch_correction_method=cfg.batch_correction_method,
+                batch_correction_eps=cfg.batch_correction_eps,
+                batch_correction_clip_min=cfg.batch_correction_clip_min,
+                batch_correction_clip_max=cfg.batch_correction_clip_max,
                 perturbation_mode=cfg.perturbation_mode,
                 cytokine_keys=cfg.cytokine_keys,
                 cytokine_transform=cfg.cytokine_transform,
@@ -210,6 +228,10 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 layer=cfg.layer,
                 cond_key=effective_batch_key,
                 batch_key=effective_batch_key,
+                batch_correction_method=cfg.batch_correction_method,
+                batch_correction_eps=cfg.batch_correction_eps,
+                batch_correction_clip_min=cfg.batch_correction_clip_min,
+                batch_correction_clip_max=cfg.batch_correction_clip_max,
                 perturbation_mode=cfg.perturbation_mode,
                 cytokine_keys=cfg.cytokine_keys,
                 cytokine_transform=cfg.cytokine_transform,
@@ -244,6 +266,10 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 layer=cfg.layer,
                 cond_key=effective_batch_key,
                 batch_key=effective_batch_key,
+                batch_correction_method=cfg.batch_correction_method,
+                batch_correction_eps=cfg.batch_correction_eps,
+                batch_correction_clip_min=cfg.batch_correction_clip_min,
+                batch_correction_clip_max=cfg.batch_correction_clip_max,
                 perturbation_mode=cfg.perturbation_mode,
                 cytokine_keys=cfg.cytokine_keys,
                 cytokine_transform=cfg.cytokine_transform,

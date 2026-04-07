@@ -3,6 +3,10 @@ gene_key: "gene"
 layer: null
 cond_key: null
 batch_key: null
+batch_correction_method: "none"
+batch_correction_eps: 1.0e-8
+batch_correction_clip_min: 0.1
+batch_correction_clip_max: 10.0
 backed: true
 
 # encoder backbone: "transformer" (default), "perceiver", or "cbow"

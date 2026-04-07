@@ -141,6 +141,10 @@ def export_cbow_vae_cell_embeddings(
     cytokine_keys = train_cfg.get("cytokine_keys", None)
     cytokine_transform = str(train_cfg.get("cytokine_transform", "log1p"))
     cytokine_missing_policy = str(train_cfg.get("cytokine_missing_policy", "error"))
+    batch_correction_method = str(train_cfg.get("batch_correction_method", "none")).lower()
+    batch_correction_eps = float(train_cfg.get("batch_correction_eps", 1e-8))
+    batch_correction_clip_min = float(train_cfg.get("batch_correction_clip_min", 0.1))
+    batch_correction_clip_max = float(train_cfg.get("batch_correction_clip_max", 10.0))
     perturb_emb_dim = int(train_cfg.get("perturb_emb_dim", 32))
 
     ds = SingleCellVAEDataset(
@@ -149,6 +153,10 @@ def export_cbow_vae_cell_embeddings(
         layer=layer,
         cond_key=effective_batch_key,
         batch_key=effective_batch_key,
+        batch_correction_method=batch_correction_method,
+        batch_correction_eps=batch_correction_eps,
+        batch_correction_clip_min=batch_correction_clip_min,
+        batch_correction_clip_max=batch_correction_clip_max,
         perturbation_mode=perturbation_mode,
         cytokine_keys=cytokine_keys,
         cytokine_transform=cytokine_transform,

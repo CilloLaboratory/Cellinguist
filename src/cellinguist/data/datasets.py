@@ -610,6 +610,10 @@ class SingleCellVAEDataset(Dataset):
         layer: Optional[str] = None,
         cond_key: Optional[str] = None,
         batch_key: Optional[str] = None,
+        batch_correction_method: str = "none",
+        batch_correction_eps: float = 1e-8,
+        batch_correction_clip_min: float = 0.1,
+        batch_correction_clip_max: float = 10.0,
         perturbation_mode: str = "none",
         cytokine_keys: Optional[list[str]] = None,
         cytokine_transform: str = "log1p",
@@ -628,6 +632,23 @@ class SingleCellVAEDataset(Dataset):
         self.transform = str(transform)
         if self.transform not in {"log1p", "none"}:
             raise ValueError(f"Unsupported transform: {transform}")
+        self.batch_correction_method = str(batch_correction_method).lower()
+        if self.batch_correction_method not in {"none", "mean_scale"}:
+            raise ValueError(
+                f"Unsupported batch_correction_method: {batch_correction_method}. "
+                "Use one of: none, mean_scale."
+            )
+        self.batch_correction_eps = float(batch_correction_eps)
+        if self.batch_correction_eps <= 0:
+            raise ValueError("batch_correction_eps must be > 0.")
+        self.batch_correction_clip_min = float(batch_correction_clip_min)
+        self.batch_correction_clip_max = float(batch_correction_clip_max)
+        if self.batch_correction_clip_min <= 0:
+            raise ValueError("batch_correction_clip_min must be > 0.")
+        if self.batch_correction_clip_max < self.batch_correction_clip_min:
+            raise ValueError(
+                "batch_correction_clip_max must be >= batch_correction_clip_min."
+            )
         self.perturbation_mode = str(perturbation_mode).lower()
         if self.perturbation_mode not in {"none", "categorical", "cytokine_vector"}:
             raise ValueError(
@@ -660,6 +681,7 @@ class SingleCellVAEDataset(Dataset):
         self._token_cache_shards: list[dict[str, Any]] = []
         self._token_cache_starts: list[int] = []
         self._token_cache_memmaps: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._batch_correction_scale_by_batch: Optional[np.ndarray] = None
 
         if isinstance(adata_or_path, ad.AnnData):
             self._adata = adata_or_path
@@ -720,6 +742,19 @@ class SingleCellVAEDataset(Dataset):
         # Backward-compatible aliases.
         self.cond_categories = self.batch_categories
         self.cond_idx = self.batch_idx
+
+        if self.batch_correction_method != "none":
+            if self.batch_idx is None:
+                raise ValueError(
+                    "batch_correction_method requires batch_key/cond_key to be set."
+                )
+            if self.batch_categories is None or len(self.batch_categories) < 2:
+                raise ValueError(
+                    "batch_correction_method requires at least 2 batch categories."
+                )
+            self._batch_correction_scale_by_batch = self._compute_batch_correction_scalers(
+                adata_probe
+            )
 
         self.cytokine_keys = list(cytokine_keys or [])
         self._perturb_matrix: Optional[np.ndarray] = None
@@ -793,12 +828,11 @@ class SingleCellVAEDataset(Dataset):
         self._adata = ad.read_h5ad(self._adata_path, **read_kwargs)
         return self._adata
 
-    def _get_row(self, idx: int, apply_transform: bool = True) -> np.ndarray:
-        adata = self._ensure_adata()
+    def _get_row_from_adata(self, adata_obj, idx: int) -> np.ndarray:
         if self.layer is None:
-            row = adata.X[idx]
+            row = adata_obj.X[idx]
         else:
-            row = adata.layers[self.layer][idx]
+            row = adata_obj.layers[self.layer][idx]
 
         if sp is not None and sp.issparse(row):
             x = np.asarray(row.toarray()).ravel()
@@ -808,6 +842,74 @@ class SingleCellVAEDataset(Dataset):
         x = x.astype(np.float32, copy=False)
         if self._gene_indices is not None:
             x = x[self._gene_indices]
+        return x
+
+    def _compute_mean_expression(self, adata_obj, indices: np.ndarray) -> np.ndarray:
+        if indices.size == 0:
+            raise ValueError("Cannot compute mean expression on an empty index set.")
+
+        chunk_size = 2048
+        total = np.zeros((self.n_genes,), dtype=np.float64)
+        count = 0
+
+        for start in range(0, int(indices.size), chunk_size):
+            chunk = indices[start : start + chunk_size]
+            if chunk.size == 0:
+                continue
+            if self.layer is None:
+                rows = adata_obj.X[chunk]
+            else:
+                rows = adata_obj.layers[self.layer][chunk]
+
+            if sp is not None and sp.issparse(rows):
+                arr = rows.toarray()
+            else:
+                arr = np.asarray(rows)
+
+            arr = arr.astype(np.float64, copy=False)
+            if self._gene_indices is not None:
+                arr = arr[:, self._gene_indices]
+            total += arr.sum(axis=0)
+            count += int(arr.shape[0])
+
+        if count <= 0:
+            raise ValueError("Failed to compute mean expression: no cells were accumulated.")
+
+        return (total / float(count)).astype(np.float32, copy=False)
+
+    def _compute_batch_correction_scalers(self, adata_obj) -> np.ndarray:
+        if self.batch_idx is None:
+            raise ValueError("Batch correction requested but batch indices are unavailable.")
+
+        batch_idx = np.asarray(self.batch_idx, dtype=np.int64)
+        n_batches = int(batch_idx.max()) + 1
+        global_idx = np.arange(self.n_cells, dtype=np.int64)
+        global_mean = self._compute_mean_expression(adata_obj, global_idx)
+
+        scales = np.ones((n_batches, self.n_genes), dtype=np.float32)
+        for b in range(n_batches):
+            idx = np.where(batch_idx == b)[0].astype(np.int64)
+            if idx.size == 0:
+                continue
+            batch_mean = self._compute_mean_expression(adata_obj, idx)
+            scale = global_mean / (batch_mean + self.batch_correction_eps)
+            scale = np.clip(
+                scale,
+                self.batch_correction_clip_min,
+                self.batch_correction_clip_max,
+            )
+            scales[b] = scale.astype(np.float32, copy=False)
+
+        return scales
+
+    def _get_row(self, idx: int, apply_transform: bool = True) -> np.ndarray:
+        adata = self._ensure_adata()
+        x = self._get_row_from_adata(adata, idx)
+
+        if self._batch_correction_scale_by_batch is not None and self.batch_idx is not None:
+            b = int(self.batch_idx[idx])
+            x = x * self._batch_correction_scale_by_batch[b]
+
         if apply_transform and self.transform == "log1p":
             x = np.log1p(x)
         return x

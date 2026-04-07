@@ -82,6 +82,10 @@ class VAETrainConfig:
     layer: Optional[str] = None
     cond_key: Optional[str] = None
     batch_key: Optional[str] = None  # Preferred alias for nuisance batch covariate.
+    batch_correction_method: str = "none"  # "none" or "mean_scale"
+    batch_correction_eps: float = 1e-8
+    batch_correction_clip_min: float = 0.1
+    batch_correction_clip_max: float = 10.0
     backed: bool = True
 
     # Used only when encoder_type == "cbow".

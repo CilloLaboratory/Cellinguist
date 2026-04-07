@@ -66,6 +66,71 @@ def test_dataset_cytokine_vector_outputs_perturb_vec(tmp_path: Path) -> None:
     assert ds.n_perturb_features == 2
 
 
+def test_dataset_batch_correction_mean_scale_reduces_batch_shift(tmp_path: Path) -> None:
+    x = np.array(
+        [
+            [10.0, 2.0, 1.0, 1.0],
+            [12.0, 1.0, 1.0, 1.0],
+            [100.0, 2.0, 1.0, 1.0],
+            [120.0, 1.0, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    obs = pd.DataFrame(
+        {
+            "batch": ["a", "a", "b", "b"],
+            "IL6": [0.0, 0.0, 0.0, 0.0],
+            "IFNG": [0.0, 0.0, 0.0, 0.0],
+        },
+        index=[f"cell_{i}" for i in range(4)],
+    )
+    var = pd.DataFrame({"gene": [f"g{i}" for i in range(4)]})
+    h5ad_path = tmp_path / "batch_shift.h5ad"
+    ad.AnnData(X=x, obs=obs, var=var).write_h5ad(h5ad_path)
+
+    ds_none = SingleCellVAEDataset(
+        adata_or_path=str(h5ad_path),
+        gene_key="gene",
+        batch_key="batch",
+        transform="none",
+        backed=False,
+    )
+    ds_corr = SingleCellVAEDataset(
+        adata_or_path=str(h5ad_path),
+        gene_key="gene",
+        batch_key="batch",
+        batch_correction_method="mean_scale",
+        transform="none",
+        backed=False,
+    )
+
+    g0_none = np.stack([ds_none[i]["x_expr"].numpy() for i in range(len(ds_none))], axis=0)[:, 0]
+    g0_corr = np.stack([ds_corr[i]["x_expr"].numpy() for i in range(len(ds_corr))], axis=0)[:, 0]
+
+    mean_a_none = float(g0_none[[0, 1]].mean())
+    mean_b_none = float(g0_none[[2, 3]].mean())
+    mean_a_corr = float(g0_corr[[0, 1]].mean())
+    mean_b_corr = float(g0_corr[[2, 3]].mean())
+
+    assert abs(mean_a_corr - mean_b_corr) < abs(mean_a_none - mean_b_none)
+    assert (g0_corr >= 0).all()
+
+
+def test_dataset_batch_correction_requires_batch_key(tmp_path: Path) -> None:
+    h5ad_path = _write_tiny_h5ad(tmp_path)
+    try:
+        SingleCellVAEDataset(
+            adata_or_path=str(h5ad_path),
+            gene_key="gene",
+            batch_correction_method="mean_scale",
+            transform="none",
+            backed=False,
+        )
+        assert False, "Expected ValueError when batch correction is enabled without batch_key/cond_key."
+    except ValueError:
+        pass
+
+
 def test_model_forward_with_and_without_perturb() -> None:
     x = torch.rand(3, 4)
     cond = torch.tensor([0, 1, 0], dtype=torch.long)

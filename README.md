@@ -25,6 +25,13 @@ The following functionality is currently implemented:
 - Data integration / batch correction
 - Cell type prediction from reference
 
+Batch-effect correction can be enabled in `vae_train.yml` with:
+- `batch_key`: `adata.obs` column defining batch/sample labels
+- `batch_correction_method`: `"none"` or `"mean_scale"`
+- `batch_correction_eps`, `batch_correction_clip_min`, `batch_correction_clip_max`
+
+`mean_scale` applies a per-gene multiplicative correction per batch before model input, with clipping to avoid extreme factors.
+
 ## Optional CBOW gene embedding pretraining
 
 CBOW pretraining is optional and only required when `encoder_type: "cbow"`.
