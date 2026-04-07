@@ -139,3 +139,24 @@ export-cbow-vae-cell-embeddings \
 ## Future directions
 
 Other functionality will be coming soon.
+
+## GRN construction design spec
+
+An implementation-ready algorithm specification for a new `construct-grn` command is available at:
+
+- `docs/construct_grn_spec.md`
+
+## Construct GRNs from a trained VAE checkpoint
+
+You can construct TF->target GRNs (global and optional context-specific networks) with:
+
+```
+construct-grn --config src/cellinguist/configs/grn_construct.yml
+```
+
+The config controls:
+- data/checkpoint inputs
+- TF list and output directory
+- perturbation-based decoder scoring parameters
+- score fusion weights (`w_a`, `w_e`, `w_d`, `w_p`)
+- optional bootstrap confidence settings

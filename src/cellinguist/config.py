@@ -199,6 +199,54 @@ class VAEExportConfig:
     device: str = "cuda"
 
 
+@dataclass
+class GRNConstructConfig:
+    adata_path: str
+    checkpoint_path: str
+    tf_list_path: str
+    out_dir: str
+
+    gene_key: str = "gene"
+    layer: Optional[str] = None
+    cond_key: Optional[str] = None
+    batch_key: Optional[str] = None
+    context_key: Optional[str] = None
+    min_cells_per_context: int = 300
+
+    max_cells: Optional[int] = None
+    max_cells_seed: int = 17
+    batch_size: int = 64
+    num_workers: int = 4
+    device: str = "cuda"
+    backed: bool = True
+
+    token_index_cache_dir: str = ""
+    token_index_cache_require: bool = False
+    transformer_precompute_token_indices: bool = True
+
+    score_min: float = 0.35
+    top_k_per_tf: int = 50
+    min_abs_effect: float = 0.01
+    allow_self_edges: bool = False
+
+    perturb_frac: float = 0.10
+    perturb_min_abs: float = 0.25
+    sign_eps: float = 1e-3
+    sign_consistency_min: float = 0.60
+
+    w_a: float = 0.25
+    w_e: float = 0.15
+    w_d: float = 0.55
+    w_p: float = 0.05
+
+    prior_edges_tsv: Optional[str] = None
+    bootstrap_iters: int = 0
+    bootstrap_cell_frac: float = 0.80
+
+    eps: float = 1e-8
+    seed: int = 0
+
+
 def load_yaml(path: str) -> Dict[str, Any]:
     p = Path(path)
     if not p.exists():

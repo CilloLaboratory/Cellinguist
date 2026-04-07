@@ -1,0 +1,44 @@
+adata_path: /path/to/input.h5ad
+checkpoint_path: /path/to/vae_transformer_last.ckpt
+tf_list_path: /path/to/tf_list.txt
+out_dir: /path/to/grn_out
+
+gene_key: gene
+layer: null
+device: cuda
+backed: true
+batch_size: 64
+num_workers: 4
+max_cells: null
+max_cells_seed: 17
+
+batch_key: null
+cond_key: null
+context_key: null
+min_cells_per_context: 300
+
+token_index_cache_dir: ""
+token_index_cache_require: false
+transformer_precompute_token_indices: true
+
+score_min: 0.35
+top_k_per_tf: 50
+min_abs_effect: 0.01
+allow_self_edges: false
+
+perturb_frac: 0.10
+perturb_min_abs: 0.25
+sign_eps: 0.001
+sign_consistency_min: 0.60
+
+w_a: 0.25
+w_e: 0.15
+w_d: 0.55
+w_p: 0.05
+
+prior_edges_tsv: null
+bootstrap_iters: 0
+bootstrap_cell_frac: 0.80
+
+eps: 1.0e-8
+seed: 0

@@ -613,7 +613,8 @@ class TransformerCellEncoder(nn.Module):
         x_expr: torch.Tensor,
         token_gene_idx: Optional[torch.Tensor] = None,
         token_gene_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_token_metadata: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, n_genes = x_expr.shape
         if n_genes != self.n_genes:
             raise ValueError(
@@ -643,6 +644,17 @@ class TransformerCellEncoder(nn.Module):
 
             tokens = x_expr.new_zeros((bsz, max_seq_len, d_model))
             key_padding_mask = torch.ones((bsz, max_seq_len), dtype=torch.bool, device=x_expr.device)
+            token_gene_idx_full = torch.full(
+                (bsz, max_seq_len),
+                fill_value=-1,
+                dtype=torch.long,
+                device=x_expr.device,
+            )
+            token_gene_mask_full = torch.zeros(
+                (bsz, max_seq_len),
+                dtype=torch.bool,
+                device=x_expr.device,
+            )
 
             cls = self.cls_token.to(dtype=tokens.dtype, device=tokens.device).squeeze(0).squeeze(0)
             cls_pos = self.pos_embedding(
@@ -663,7 +675,11 @@ class TransformerCellEncoder(nn.Module):
                 seq_len = int(idx.numel())
                 tokens[i, 1 : seq_len + 1, :] = token_vec
                 key_padding_mask[i, 1 : seq_len + 1] = False
+                token_gene_idx_full[i, 1 : seq_len + 1] = idx
+                token_gene_mask_full[i, 1 : seq_len + 1] = True
 
+            if return_token_metadata:
+                return tokens, key_padding_mask, token_gene_idx_full, token_gene_mask_full
             return tokens, key_padding_mask
 
         token_gene_idx = token_gene_idx.to(device=x_expr.device, dtype=torch.long)
@@ -688,6 +704,15 @@ class TransformerCellEncoder(nn.Module):
                 torch.tensor([0], dtype=torch.long, device=x_expr.device)
             ).view(1, 1, -1).to(dtype=tokens.dtype, device=tokens.device)
             tokens[:, :1, :] = cls + cls_pos
+            if return_token_metadata:
+                token_gene_idx_full = torch.full(
+                    (bsz, 1),
+                    fill_value=-1,
+                    dtype=torch.long,
+                    device=x_expr.device,
+                )
+                token_gene_mask_full = torch.zeros((bsz, 1), dtype=torch.bool, device=x_expr.device)
+                return tokens, key_padding_mask, token_gene_idx_full, token_gene_mask_full
             return tokens, key_padding_mask
 
         idx_safe = token_gene_idx.clamp(min=0, max=self.n_genes - 1)
@@ -710,8 +735,68 @@ class TransformerCellEncoder(nn.Module):
         tokens[:, 1:, :] = token_vec
         key_padding_mask[:, 0] = False
         key_padding_mask[:, 1:] = ~token_gene_mask
-
+        if return_token_metadata:
+            token_gene_idx_full = torch.full(
+                (bsz, max_l + 1),
+                fill_value=-1,
+                dtype=torch.long,
+                device=x_expr.device,
+            )
+            token_gene_idx_full[:, 1:] = idx_safe
+            token_gene_mask_full = torch.zeros((bsz, max_l + 1), dtype=torch.bool, device=x_expr.device)
+            token_gene_mask_full[:, 1:] = token_gene_mask
+            return tokens, key_padding_mask, token_gene_idx_full, token_gene_mask_full
         return tokens, key_padding_mask
+
+    def _run_transformer(
+        self,
+        tokens: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+        return_attention: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if not return_attention:
+            hidden = self.transformer(tokens, src_key_padding_mask=key_padding_mask)
+            return hidden, None
+
+        hidden = tokens
+        attn_by_layer: list[torch.Tensor] = []
+        for layer in self.transformer.layers:
+            if layer.norm_first:
+                qkv = layer.norm1(hidden)
+                attn_out, attn_w = layer.self_attn(
+                    qkv,
+                    qkv,
+                    qkv,
+                    attn_mask=None,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=True,
+                    average_attn_weights=False,
+                )
+                hidden = hidden + layer.dropout1(attn_out)
+                ff_in = layer.norm2(hidden)
+                ff = layer.linear2(layer.dropout(layer.activation(layer.linear1(ff_in))))
+                hidden = hidden + layer.dropout2(ff)
+            else:
+                attn_out, attn_w = layer.self_attn(
+                    hidden,
+                    hidden,
+                    hidden,
+                    attn_mask=None,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=True,
+                    average_attn_weights=False,
+                )
+                hidden = layer.norm1(hidden + layer.dropout1(attn_out))
+                ff = layer.linear2(layer.dropout(layer.activation(layer.linear1(hidden))))
+                hidden = layer.norm2(hidden + layer.dropout2(ff))
+            attn_by_layer.append(attn_w)
+
+        if self.transformer.norm is not None:
+            hidden = self.transformer.norm(hidden)
+
+        if len(attn_by_layer) == 0:
+            return hidden, None
+        return hidden, torch.stack(attn_by_layer, dim=1)
 
     def forward(
         self,
@@ -727,7 +812,11 @@ class TransformerCellEncoder(nn.Module):
             token_gene_idx=token_gene_idx,
             token_gene_mask=token_gene_mask,
         )
-        hidden = self.transformer(tokens, src_key_padding_mask=key_padding_mask)
+        hidden, _ = self._run_transformer(
+            tokens=tokens,
+            key_padding_mask=key_padding_mask,
+            return_attention=False,
+        )
         h_cell = self.final_norm(hidden[:, 0, :])
 
         if self.cond_embedding is not None and cond_idx is not None:
@@ -745,6 +834,50 @@ class TransformerCellEncoder(nn.Module):
         mu = self.mlp_mu(h_in)
         logvar = self.mlp_logvar(h_in)
         return mu, logvar
+
+    def forward_with_attention(
+        self,
+        x_expr: torch.Tensor,
+        cond_idx: Optional[torch.Tensor] = None,
+        perturb_vec: Optional[torch.Tensor] = None,
+        token_gene_idx: Optional[torch.Tensor] = None,
+        token_gene_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        tokens, key_padding_mask, token_gene_idx_full, token_gene_mask_full = self._build_token_batch(
+            x_expr,
+            token_gene_idx=token_gene_idx,
+            token_gene_mask=token_gene_mask,
+            return_token_metadata=True,
+        )
+        hidden, attn_weights = self._run_transformer(
+            tokens=tokens,
+            key_padding_mask=key_padding_mask,
+            return_attention=True,
+        )
+        h_cell = self.final_norm(hidden[:, 0, :])
+
+        if self.cond_embedding is not None and cond_idx is not None:
+            c = self.cond_embedding(cond_idx)
+            h_in = torch.cat([h_cell, c], dim=-1)
+        else:
+            h_in = h_cell
+
+        if self.perturb_projector is not None:
+            if perturb_vec is None:
+                raise ValueError("perturb_vec is required when perturbation_dim is configured.")
+            p = self.perturb_projector(perturb_vec.to(dtype=h_in.dtype, device=h_in.device))
+            h_in = torch.cat([h_in, p], dim=-1)
+
+        mu = self.mlp_mu(h_in)
+        logvar = self.mlp_logvar(h_in)
+        extras = {
+            "token_gene_idx": token_gene_idx_full,
+            "token_gene_mask": token_gene_mask_full,
+            "key_padding_mask": key_padding_mask,
+        }
+        if attn_weights is not None:
+            extras["attn_weights"] = attn_weights
+        return mu, logvar, extras
 
 # ---------------------------------------------------------------------------
 # ExpressionDecoder: z (+ cond) -> reconstructed expression

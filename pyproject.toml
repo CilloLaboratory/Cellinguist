@@ -51,3 +51,4 @@ export-perceiver-gene-embeddings = "cellinguist.scripts.export_perceiver_gene_em
 precompute-transformer-token-indices = "cellinguist.scripts.precompute_transformer_token_indices:main"
 export-transformer-gene-embeddings = "cellinguist.scripts.export_transformer_gene_embeddings:main"
 export-transformer-cell-embeddings = "cellinguist.scripts.export_transformer_cell_embeddings:main"
+construct-grn = "cellinguist.scripts.construct_grn:main"
