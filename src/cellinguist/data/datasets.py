@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from bisect import bisect_right
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -33,14 +33,6 @@ except ImportError as e:
     ) from e
 
 from collections import Counter
-
-from typing import Optional, Dict, Any
-from dataclasses import dataclass
-from bisect import bisect_right
-from pathlib import Path
-import numpy as np
-import torch
-from torch.utils.data import Dataset
 
 from cellinguist.utils.token_index_cache import (
     load_cache_metadata,
@@ -1064,3 +1056,163 @@ class SingleCellVAEDataset(Dataset):
                 self._adata.file.close()
             except Exception:
                 pass
+
+
+class SamplePhenotypeDataset(Dataset):
+    """
+    Groups per-cell VAE inputs into sample-level bags for phenotype modeling.
+    """
+
+    def __init__(
+        self,
+        cell_dataset: SingleCellVAEDataset,
+        sample_key: str,
+        phenotype_key: Optional[str] = None,
+        phenotype_tsv_path: Optional[str] = None,
+        phenotype_tsv_sample_col: str = "sample_id",
+        phenotype_tsv_value_col: str = "phenotype",
+        cell_type_key: Optional[str] = None,
+        max_cells_per_sample: Optional[int] = None,
+        cell_subsample_mode: str = "random",
+        seed: int = 0,
+    ) -> None:
+        super().__init__()
+        self.cell_dataset = cell_dataset
+        self.sample_key = str(sample_key)
+        self.phenotype_key = phenotype_key
+        self.phenotype_tsv_path = phenotype_tsv_path
+        self.phenotype_tsv_sample_col = str(phenotype_tsv_sample_col)
+        self.phenotype_tsv_value_col = str(phenotype_tsv_value_col)
+        self.cell_type_key = cell_type_key
+        self.max_cells_per_sample = None if max_cells_per_sample is None else int(max_cells_per_sample)
+        self.cell_subsample_mode = str(cell_subsample_mode).lower()
+        self.seed = int(seed)
+        self.rng = np.random.default_rng(self.seed)
+
+        if self.max_cells_per_sample is not None and self.max_cells_per_sample <= 0:
+            raise ValueError("max_cells_per_sample must be > 0 when provided.")
+        if self.cell_subsample_mode not in {"random", "head"}:
+            raise ValueError("cell_subsample_mode must be one of: random, head.")
+
+        obs = self.cell_dataset.adata.obs.copy()
+        if self.sample_key not in obs.columns:
+            raise ValueError(
+                f"sample_key '{self.sample_key}' not found in adata.obs. "
+                f"Available columns: {list(obs.columns)}"
+            )
+        if self.cell_type_key is not None and self.cell_type_key not in obs.columns:
+            raise ValueError(
+                f"cell_type_key '{self.cell_type_key}' not found in adata.obs. "
+                f"Available columns: {list(obs.columns)}"
+            )
+
+        self.obs_names = self.cell_dataset.obs_names
+        self.sample_ids = obs[self.sample_key].astype(str).to_numpy()
+        self.cell_type_values = (
+            obs[self.cell_type_key].astype(str).to_numpy()
+            if self.cell_type_key is not None
+            else np.asarray([""] * len(obs), dtype=object)
+        )
+
+        self.sample_to_indices: dict[str, np.ndarray] = {}
+        for i, sample_id in enumerate(self.sample_ids):
+            self.sample_to_indices.setdefault(str(sample_id), []).append(i)
+        self.sample_to_indices = {
+            k: np.asarray(v, dtype=np.int64)
+            for k, v in self.sample_to_indices.items()
+        }
+        self.sample_order = sorted(self.sample_to_indices.keys())
+
+        self.sample_to_phenotype = self._resolve_sample_phenotypes(obs)
+        self.samples = [
+            {
+                "sample_id": sample_id,
+                "indices": self.sample_to_indices[sample_id],
+                "phenotype": float(self.sample_to_phenotype[sample_id]),
+            }
+            for sample_id in self.sample_order
+        ]
+
+    def _resolve_sample_phenotypes(self, obs: pd.DataFrame) -> dict[str, float]:
+        out: dict[str, float] = {}
+        if self.phenotype_tsv_path:
+            df = pd.read_csv(self.phenotype_tsv_path, sep="\t")
+            needed = {self.phenotype_tsv_sample_col, self.phenotype_tsv_value_col}
+            if not needed.issubset(set(df.columns)):
+                raise ValueError(
+                    "phenotype_tsv_path must contain columns "
+                    f"{sorted(needed)}. Got: {df.columns.tolist()}"
+                )
+            for row in df.itertuples(index=False):
+                sample_id = str(getattr(row, self.phenotype_tsv_sample_col))
+                value = float(getattr(row, self.phenotype_tsv_value_col))
+                out[sample_id] = value
+            missing = [sid for sid in self.sample_order if sid not in out]
+            if missing:
+                raise ValueError(
+                    "phenotype_tsv_path is missing phenotype rows for some samples. "
+                    f"Example missing sample_id: {missing[0]}"
+                )
+            return out
+
+        if not self.phenotype_key:
+            raise ValueError("Either phenotype_key or phenotype_tsv_path must be provided.")
+        if self.phenotype_key not in obs.columns:
+            raise ValueError(
+                f"phenotype_key '{self.phenotype_key}' not found in adata.obs. "
+                f"Available columns: {list(obs.columns)}"
+            )
+
+        phen = pd.to_numeric(obs[self.phenotype_key], errors="coerce")
+        if phen.isna().any():
+            raise ValueError(f"phenotype_key '{self.phenotype_key}' contains NaN/non-numeric values.")
+
+        for sample_id, idx in self.sample_to_indices.items():
+            vals = phen.iloc[idx].to_numpy(dtype=np.float32)
+            unique = np.unique(vals)
+            if unique.size != 1:
+                raise ValueError(
+                    f"Phenotype values must be constant within each sample. "
+                    f"Sample '{sample_id}' has {unique.size} distinct values."
+                )
+            out[sample_id] = float(unique[0])
+        return out
+
+    def _select_indices(self, indices: np.ndarray) -> np.ndarray:
+        if self.max_cells_per_sample is None or indices.size <= self.max_cells_per_sample:
+            return indices
+        if self.cell_subsample_mode == "head":
+            return indices[: self.max_cells_per_sample]
+        chosen = self.rng.choice(
+            indices,
+            size=self.max_cells_per_sample,
+            replace=False,
+        )
+        return np.sort(chosen.astype(np.int64))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        sample = self.samples[idx]
+        sample_id = str(sample["sample_id"])
+        selected = self._select_indices(sample["indices"])
+
+        items = [self.cell_dataset[int(i)] for i in selected.tolist()]
+        out: dict[str, Any] = {
+            "sample_id": sample_id,
+            "phenotype": float(sample["phenotype"]),
+            "x_expr": torch.stack([item["x_expr"] for item in items], dim=0),
+            "libsize": torch.stack([item["libsize"] for item in items], dim=0),
+            "cell_ids": self.obs_names[selected].tolist(),
+            "cell_types": self.cell_type_values[selected].tolist(),
+        }
+        if "batch_idx" in items[0]:
+            out["batch_idx"] = torch.stack([item["batch_idx"] for item in items], dim=0)
+        if "cond_idx" in items[0]:
+            out["cond_idx"] = torch.stack([item["cond_idx"] for item in items], dim=0)
+        if "perturb_vec" in items[0]:
+            out["perturb_vec"] = torch.stack([item["perturb_vec"] for item in items], dim=0)
+        if "token_gene_idx" in items[0]:
+            out["token_gene_idx"] = [item["token_gene_idx"] for item in items]
+        return out

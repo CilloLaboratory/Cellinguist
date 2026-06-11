@@ -21,3 +21,7 @@ max_cells_seed: null
 batch_size: 64
 num_workers: 4
 device: "cuda"
+backed: true
+token_index_cache_dir: ""
+token_index_cache_require: false
+transformer_precompute_token_indices: true

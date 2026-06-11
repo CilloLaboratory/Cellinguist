@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import anndata as ad
@@ -7,6 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from cellinguist.config import CytokineTreatmentPredictionConfig, VAEExportConfig
 from cellinguist.data.datasets import SingleCellVAEDataset
 from cellinguist.models.vae import (
     BatchAdversary,
@@ -17,7 +19,11 @@ from cellinguist.models.vae import (
 )
 from cellinguist.scripts.export_transformer_cell_embeddings import export_transformer_cell_embeddings
 from cellinguist.scripts.export_transformer_gene_embeddings import export_transformer_gene_embeddings
-from cellinguist.scripts.export_vae_predictions import _load_counterfactual_overrides
+from cellinguist.scripts.export_vae_predictions import (
+    _load_counterfactual_overrides,
+    export_predictions,
+)
+from cellinguist.scripts.predict_cytokine_treatment import predict_cytokine_treatment
 from cellinguist.utils.perturbation_split import build_cytokine_combo_split
 from cellinguist.utils.vae_io import load_vae_checkpoint, save_vae_checkpoint
 
@@ -45,6 +51,88 @@ def _write_tiny_h5ad(tmp_path: Path) -> Path:
     out = tmp_path / "tiny.h5ad"
     adata.write_h5ad(out)
     return out
+
+
+def _write_override_tsv(tmp_path: Path, *, include_extra: bool = False) -> Path:
+    data = {
+        "cell_id": [f"cell_{i}" for i in range(4)],
+        "IL6": [1.0, 1.0, 0.0, 0.0],
+        "IFNG": [0.0, 0.0, 1.0, 1.0],
+    }
+    if include_extra:
+        data["cell_id"].append("cell_extra")
+        data["IL6"].append(0.0)
+        data["IFNG"].append(0.0)
+    out = tmp_path / "override.tsv"
+    pd.DataFrame(data).to_csv(out, sep="\t", index=False)
+    return out
+
+
+def _write_tiny_transformer_cytokine_ckpt(tmp_path: Path, *, perturbation_mode: str = "cytokine_vector") -> Path:
+    encoder = TransformerCellEncoder(
+        n_genes=4,
+        latent_dim=5,
+        hidden_dim=8,
+        n_hidden_layers=1,
+        n_conditions=2,
+        cond_emb_dim=4,
+        perturbation_dim=(2 if perturbation_mode == "cytokine_vector" else None),
+        perturb_emb_dim=6,
+        input_transform="none",
+        transformer_d_model=8,
+        transformer_n_heads=2,
+        transformer_n_layers=1,
+        transformer_ff_mult=2,
+        token_mlp_hidden_dim=8,
+        token_mlp_layers=1,
+        max_tokens_per_cell=3,
+        min_expr_for_token=0.0,
+    )
+    decoder = ZINBExpressionDecoder(
+        n_genes=4,
+        latent_dim=5,
+        hidden_dim=8,
+        n_hidden_layers=1,
+        n_conditions=2,
+        cond_emb_dim=4,
+        perturbation_dim=(2 if perturbation_mode == "cytokine_vector" else None),
+        perturb_emb_dim=6,
+    )
+    model = GeneVAE(encoder, decoder)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    ckpt_path = tmp_path / f"transformer_{perturbation_mode}.ckpt"
+    save_vae_checkpoint(
+        path=str(ckpt_path),
+        model=model,
+        optimizer=opt,
+        epoch=0,
+        genes_common=["g0", "g1", "g2", "g3"],
+        config_snapshot={
+            "encoder_type": "transformer",
+            "latent_dim": 5,
+            "hidden_dim": 8,
+            "n_hidden_layers": 1,
+            "cond_emb_dim": 4,
+            "input_transform": "none",
+            "transformer_d_model": 8,
+            "transformer_n_heads": 2,
+            "transformer_n_layers": 1,
+            "transformer_ff_mult": 2,
+            "token_mlp_hidden_dim": 8,
+            "token_mlp_layers": 1,
+            "max_tokens_per_cell": 3,
+            "min_expr_for_token": 0.0,
+            "transformer_precompute_token_indices": True,
+            "perturbation_mode": perturbation_mode,
+            "cytokine_keys": ["IL6", "IFNG"] if perturbation_mode == "cytokine_vector" else None,
+            "cytokine_transform": "none",
+            "cytokine_missing_policy": "error",
+            "perturb_emb_dim": 6,
+        },
+        gene_emb_source="",
+    )
+    return ckpt_path
 
 
 def test_dataset_cytokine_vector_outputs_perturb_vec(tmp_path: Path) -> None:
@@ -263,6 +351,23 @@ def test_counterfactual_override_order_validation(tmp_path: Path) -> None:
         pass
 
 
+def test_counterfactual_override_duplicate_cell_ids_fail(tmp_path: Path) -> None:
+    override_path = tmp_path / "override_dupe.tsv"
+    pd.DataFrame(
+        {
+            "cell_id": ["cell_0", "cell_0"],
+            "IL6": [0.0, 1.0],
+            "IFNG": [1.0, 0.0],
+        }
+    ).to_csv(override_path, sep="\t", index=False)
+
+    try:
+        _load_counterfactual_overrides(str(override_path), ["IL6", "IFNG"])
+        assert False, "Expected ValueError for duplicate cell_id entries."
+    except ValueError:
+        pass
+
+
 def test_cytokine_combo_split_builds_holdout() -> None:
     mat = np.array(
         [
@@ -439,6 +544,146 @@ def test_transformer_model_forward_with_and_without_perturb() -> None:
         perturb_vec=perturb,
     )
     assert recon_out2[0].shape == (3, 4)
+
+
+def test_transformer_dataset_emits_perturb_and_token_indices_together(tmp_path: Path) -> None:
+    h5ad_path = _write_tiny_h5ad(tmp_path)
+    ds = SingleCellVAEDataset(
+        adata_or_path=str(h5ad_path),
+        gene_key="gene",
+        batch_key="batch",
+        perturbation_mode="cytokine_vector",
+        cytokine_keys=["IL6", "IFNG"],
+        cytokine_transform="none",
+        cytokine_missing_policy="error",
+        transform="none",
+        backed=False,
+        precompute_token_gene_indices=True,
+        token_min_expr=0.0,
+        token_max_genes=3,
+    )
+    item = ds[0]
+    assert "perturb_vec" in item
+    assert "token_gene_idx" in item
+    assert item["perturb_vec"].shape == (2,)
+    assert item["token_gene_idx"].ndim == 1
+
+
+def test_export_vae_predictions_transformer_counterfactual_uses_checkpoint_cytokine_config(tmp_path: Path) -> None:
+    h5ad_path = _write_tiny_h5ad(tmp_path)
+    ckpt_path = _write_tiny_transformer_cytokine_ckpt(tmp_path, perturbation_mode="cytokine_vector")
+    override_path = _write_override_tsv(tmp_path)
+    out_path = tmp_path / "pred_mu.tsv.gz"
+
+    export_predictions(
+        VAEExportConfig(
+            adata_path=str(h5ad_path),
+            checkpoint_path=str(ckpt_path),
+            counterfactual_override_path=str(override_path),
+            out_pred_tsv_gz=str(out_path),
+            gene_key="gene",
+            batch_key="batch",
+            batch_size=2,
+            num_workers=0,
+            device="cpu",
+            backed=False,
+            transformer_precompute_token_indices=True,
+        )
+    )
+
+    df = pd.read_csv(out_path, sep="\t")
+    metadata = json.loads(Path(str(out_path) + ".metadata.json").read_text())
+    assert df.shape == (4, 5)
+    assert df.columns.tolist() == ["cell_id", "g0", "g1", "g2", "g3"]
+    assert metadata["encoder_type"] == "transformer"
+    assert metadata["cytokine_keys"] == ["IL6", "IFNG"]
+    assert metadata["n_exported_cells"] == 4
+
+
+def test_export_vae_predictions_transformer_none_mode_regression(tmp_path: Path) -> None:
+    h5ad_path = _write_tiny_h5ad(tmp_path)
+    ckpt_path = _write_tiny_transformer_cytokine_ckpt(tmp_path, perturbation_mode="none")
+    out_path = tmp_path / "pred_none.tsv.gz"
+
+    export_predictions(
+        VAEExportConfig(
+            adata_path=str(h5ad_path),
+            checkpoint_path=str(ckpt_path),
+            out_pred_tsv_gz=str(out_path),
+            gene_key="gene",
+            batch_key="batch",
+            batch_size=2,
+            num_workers=0,
+            device="cpu",
+            backed=False,
+            transformer_precompute_token_indices=True,
+        )
+    )
+
+    df = pd.read_csv(out_path, sep="\t")
+    assert df.shape == (4, 5)
+
+
+def test_predict_cytokine_treatment_outputs_baseline_treated_and_delta(tmp_path: Path) -> None:
+    h5ad_path = _write_tiny_h5ad(tmp_path)
+    ckpt_path = _write_tiny_transformer_cytokine_ckpt(tmp_path, perturbation_mode="cytokine_vector")
+    override_path = _write_override_tsv(tmp_path)
+    out_dir = tmp_path / "cytokine_out"
+
+    predict_cytokine_treatment(
+        CytokineTreatmentPredictionConfig(
+            adata_path=str(h5ad_path),
+            checkpoint_path=str(ckpt_path),
+            counterfactual_override_path=str(override_path),
+            out_dir=str(out_dir),
+            gene_key="gene",
+            batch_key="batch",
+            batch_size=2,
+            num_workers=0,
+            device="cpu",
+            backed=False,
+            transformer_precompute_token_indices=True,
+        )
+    )
+
+    baseline_df = pd.read_csv(out_dir / "pred_baseline.tsv.gz", sep="\t")
+    treated_df = pd.read_csv(out_dir / "pred_treated.tsv.gz", sep="\t")
+    delta_df = pd.read_csv(out_dir / "delta.tsv.gz", sep="\t")
+    metadata = json.loads((out_dir / "metadata.json").read_text())
+
+    gene_cols = ["g0", "g1", "g2", "g3"]
+    expected_delta = treated_df[gene_cols].to_numpy() - baseline_df[gene_cols].to_numpy()
+    assert baseline_df["cell_id"].tolist() == ["cell_0", "cell_1", "cell_2", "cell_3"]
+    assert treated_df["cell_id"].tolist() == baseline_df["cell_id"].tolist()
+    assert delta_df["cell_id"].tolist() == baseline_df["cell_id"].tolist()
+    assert np.allclose(delta_df[gene_cols].to_numpy(), expected_delta)
+    assert metadata["cytokine_keys"] == ["IL6", "IFNG"]
+    assert metadata["encoder_type"] == "transformer"
+
+
+def test_predict_cytokine_treatment_rejects_extra_override_rows(tmp_path: Path) -> None:
+    h5ad_path = _write_tiny_h5ad(tmp_path)
+    ckpt_path = _write_tiny_transformer_cytokine_ckpt(tmp_path, perturbation_mode="cytokine_vector")
+    override_path = _write_override_tsv(tmp_path, include_extra=True)
+
+    try:
+        predict_cytokine_treatment(
+            CytokineTreatmentPredictionConfig(
+                adata_path=str(h5ad_path),
+                checkpoint_path=str(ckpt_path),
+                counterfactual_override_path=str(override_path),
+                out_dir=str(tmp_path / "unused"),
+                gene_key="gene",
+                batch_key="batch",
+                batch_size=2,
+                num_workers=0,
+                device="cpu",
+                backed=False,
+            )
+        )
+        assert False, "Expected ValueError for extra override rows."
+    except ValueError:
+        pass
 
 
 def test_export_transformer_gene_embeddings_writes_tsv(tmp_path: Path) -> None:

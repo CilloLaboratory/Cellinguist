@@ -136,6 +136,28 @@ export-cbow-vae-cell-embeddings \
   --out /home/arc85/Desktop/cellinguist_results_251125/02_hnscc_test_260303/03_output/hnscc_2k_hvg_cbow_vae_cell_embeddings_260303.tsv.gz
 ```
 
+## Predict cytokine treatment consequences
+
+For transformer VAE checkpoints trained with `perturbation_mode: "cytokine_vector"`, use:
+
+```
+predict-cytokine-treatment /path/to/cytokine_treatment_prediction.yml
+```
+
+The override TSV must contain:
+- `cell_id`
+- one column per checkpoint-resolved cytokine key, in exact order
+
+The command writes:
+- `pred_baseline.tsv.gz`
+- `pred_treated.tsv.gz`
+- `delta.tsv.gz`
+- `metadata.json`
+
+Transformer cytokine conditioning in the current implementation does not inject cytokine tokens into self-attention. Instead, the cytokine vector is projected with `PerturbationProjector`, concatenated after CLS pooling in the encoder, and concatenated again in the decoder.
+
+If you trained with a transformer token index cache, set `token_index_cache_dir` in the prediction config to reuse it during inference.
+
 ## Future directions
 
 Other functionality will be coming soon.

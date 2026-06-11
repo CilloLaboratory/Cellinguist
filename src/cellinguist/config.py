@@ -197,6 +197,41 @@ class VAEExportConfig:
     batch_size: int = 64
     num_workers: int = 4
     device: str = "cuda"
+    backed: bool = True
+    token_index_cache_dir: str = ""
+    token_index_cache_require: bool = False
+    transformer_precompute_token_indices: bool = True
+
+
+@dataclass
+class CytokineTreatmentPredictionConfig:
+    adata_path: str
+    checkpoint_path: str
+    counterfactual_override_path: str
+    out_dir: str
+
+    gene_key: str = "gene"
+    layer: Optional[str] = None
+    cond_key: Optional[str] = None
+    batch_key: Optional[str] = None
+
+    perturbation_mode: Optional[str] = None
+    cytokine_keys: Optional[List[str]] = None
+    cytokine_transform: Optional[str] = None
+    cytokine_missing_policy: Optional[str] = None
+    perturb_emb_dim: Optional[int] = None
+
+    gene_emb_tsv: str = ""
+
+    max_cells: Optional[int] = None
+    max_cells_seed: Optional[int] = None
+    batch_size: int = 64
+    num_workers: int = 4
+    device: str = "cuda"
+    backed: bool = True
+    token_index_cache_dir: str = ""
+    token_index_cache_require: bool = False
+    transformer_precompute_token_indices: bool = True
 
 
 @dataclass
@@ -245,6 +280,144 @@ class GRNConstructConfig:
 
     eps: float = 1e-8
     seed: int = 0
+
+
+@dataclass
+class PhenotypeTrainConfig:
+    adata_path: str
+    vae_checkpoint_path: str
+    sample_key: str
+
+    phenotype_key: Optional[str] = None
+    phenotype_tsv_path: Optional[str] = None
+    phenotype_tsv_sample_col: str = "sample_id"
+    phenotype_tsv_value_col: str = "phenotype"
+
+    gene_key: str = "gene"
+    layer: Optional[str] = None
+    cond_key: Optional[str] = None
+    batch_key: Optional[str] = None
+    cell_type_key: Optional[str] = None
+    backed: bool = True
+
+    batch_correction_method: Optional[str] = None
+    batch_correction_eps: Optional[float] = None
+    batch_correction_clip_min: Optional[float] = None
+    batch_correction_clip_max: Optional[float] = None
+    perturbation_mode: Optional[str] = None
+    cytokine_keys: Optional[List[str]] = None
+    cytokine_transform: Optional[str] = None
+    cytokine_missing_policy: Optional[str] = None
+    perturb_emb_dim: Optional[int] = None
+
+    freeze_vae_encoder: bool = True
+    max_cells_per_sample: Optional[int] = None
+    cell_subsample_mode: str = "random"  # "random" | "head"
+
+    aggregator_hidden_dim: int = 128
+    aggregator_latent_dim: int = 64
+    predictor_hidden_dim: int = 128
+    predictor_n_hidden_layers: int = 1
+    dropout: float = 0.1
+
+    batch_size_samples: int = 8
+    epochs: int = 25
+    lr: float = 1e-3
+    weight_decay: float = 0.0
+    grad_clip_norm: float = 1.0
+    val_fraction: float = 0.2
+    min_train_samples: int = 2
+
+    num_workers: int = 0
+    device: str = "cuda"
+    seed: int = 0
+
+    checkpoint_dir: str = "checkpoints"
+    run_name: str = "phenotype_model"
+    resume_from: Optional[str] = None
+
+
+@dataclass
+class PhenotypePredictConfig:
+    adata_path: str
+    vae_checkpoint_path: str
+    phenotype_checkpoint_path: str
+    out_dir: str
+    sample_key: str
+
+    phenotype_key: Optional[str] = None
+    phenotype_tsv_path: Optional[str] = None
+    phenotype_tsv_sample_col: str = "sample_id"
+    phenotype_tsv_value_col: str = "phenotype"
+
+    gene_key: str = "gene"
+    layer: Optional[str] = None
+    cond_key: Optional[str] = None
+    batch_key: Optional[str] = None
+    cell_type_key: Optional[str] = None
+    backed: bool = True
+
+    batch_correction_method: Optional[str] = None
+    batch_correction_eps: Optional[float] = None
+    batch_correction_clip_min: Optional[float] = None
+    batch_correction_clip_max: Optional[float] = None
+    perturbation_mode: Optional[str] = None
+    cytokine_keys: Optional[List[str]] = None
+    cytokine_transform: Optional[str] = None
+    cytokine_missing_policy: Optional[str] = None
+    perturb_emb_dim: Optional[int] = None
+
+    max_cells_per_sample: Optional[int] = None
+    cell_subsample_mode: str = "head"
+    batch_size_samples: int = 8
+    num_workers: int = 0
+    device: str = "cuda"
+    seed: int = 0
+
+    explanation_top_k: int = 5
+    latent_cluster_count: int = 8
+
+
+@dataclass
+class PhenotypeCounterfactualConfig:
+    adata_path: str
+    vae_checkpoint_path: str
+    phenotype_checkpoint_path: str
+    intervention_path: str
+    out_dir: str
+    sample_key: str
+
+    phenotype_key: Optional[str] = None
+    phenotype_tsv_path: Optional[str] = None
+    phenotype_tsv_sample_col: str = "sample_id"
+    phenotype_tsv_value_col: str = "phenotype"
+
+    gene_key: str = "gene"
+    layer: Optional[str] = None
+    cond_key: Optional[str] = None
+    batch_key: Optional[str] = None
+    cell_type_key: Optional[str] = None
+    backed: bool = True
+
+    batch_correction_method: Optional[str] = None
+    batch_correction_eps: Optional[float] = None
+    batch_correction_clip_min: Optional[float] = None
+    batch_correction_clip_max: Optional[float] = None
+    perturbation_mode: Optional[str] = None
+    cytokine_keys: Optional[List[str]] = None
+    cytokine_transform: Optional[str] = None
+    cytokine_missing_policy: Optional[str] = None
+    perturb_emb_dim: Optional[int] = None
+
+    max_cells_per_sample: Optional[int] = None
+    cell_subsample_mode: str = "head"
+    batch_size_samples: int = 8
+    num_workers: int = 0
+    device: str = "cuda"
+    seed: int = 0
+
+    explanation_top_k: int = 5
+    latent_cluster_count: int = 8
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
