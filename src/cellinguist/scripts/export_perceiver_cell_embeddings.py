@@ -42,6 +42,8 @@ def build_perceiver_vae_from_checkpoint(
     library_norm = str(train_cfg.get("library_norm", "size_factor"))
     library_norm_target_sum = float(train_cfg.get("library_norm_target_sum", 1e4))
     library_norm_eps = float(train_cfg.get("library_norm_eps", 1e-8))
+    perturb_condition_encoder = bool(train_cfg.get("perturb_condition_encoder", True))
+    perturb_condition_decoder = bool(train_cfg.get("perturb_condition_decoder", True))
 
     encoder = PerceiverCellEncoder(
         n_genes=n_genes,
@@ -52,6 +54,7 @@ def build_perceiver_vae_from_checkpoint(
         cond_emb_dim=cond_emb_dim,
         perturbation_dim=perturbation_dim,
         perturb_emb_dim=perturb_emb_dim,
+        perturb_condition_encoder=perturb_condition_encoder,
         input_transform=input_transform,
         library_norm=library_norm,
         library_norm_target_sum=library_norm_target_sum,
@@ -73,6 +76,7 @@ def build_perceiver_vae_from_checkpoint(
         cond_emb_dim=cond_emb_dim,
         perturbation_dim=perturbation_dim,
         perturb_emb_dim=perturb_emb_dim,
+        perturb_condition_decoder=perturb_condition_decoder,
         use_library_size_covariate=bool(train_cfg.get("use_library_size_covariate", False)),
         library_size_covariate_eps=float(train_cfg.get("library_size_covariate_eps", 1e-8)),
     )

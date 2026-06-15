@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime
 import os
 import traceback
@@ -107,6 +108,54 @@ def _resolve_batch_key(batch_key: Optional[str], cond_key: Optional[str]) -> Opt
             f"Both batch_key='{batch_key}' and cond_key='{cond_key}' were provided, but differ."
         )
     return batch_key if batch_key is not None else cond_key
+
+
+def _resolve_loss_csv_path(cfg: VAETrainConfig) -> str:
+    if cfg.loss_csv_path:
+        return str(cfg.loss_csv_path)
+    return str(Path(cfg.checkpoint_dir) / f"{cfg.run_name}_losses.csv")
+
+
+def _append_epoch_loss_row(
+    path: str,
+    *,
+    epoch: int,
+    train_loss: float,
+    train_recon: float,
+    train_kl: float,
+    train_metric: float,
+    train_adv: float,
+    val_recon: Optional[float],
+) -> None:
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = (not out_path.exists()) or out_path.stat().st_size == 0
+    with out_path.open("a", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "epoch",
+                "train_loss",
+                "train_recon",
+                "train_kl",
+                "train_metric",
+                "train_adv",
+                "val_recon",
+            ],
+        )
+        if write_header:
+            writer.writeheader()
+        writer.writerow(
+            {
+                "epoch": int(epoch),
+                "train_loss": float(train_loss),
+                "train_recon": float(train_recon),
+                "train_kl": float(train_kl),
+                "train_metric": float(train_metric),
+                "train_adv": float(train_adv),
+                "val_recon": ("" if val_recon is None else float(val_recon)),
+            }
+        )
 
 
 def train_vae(cfg: VAETrainConfig) -> str:
@@ -493,6 +542,11 @@ def train_vae(cfg: VAETrainConfig) -> str:
         ckpt_dir = Path(cfg.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         ckpt_last = str(ckpt_dir / f"{cfg.run_name}_last.ckpt")
+        loss_csv_path = _resolve_loss_csv_path(cfg)
+        if is_main and not cfg.resume_from:
+            loss_csv_file = Path(loss_csv_path)
+            if loss_csv_file.exists():
+                loss_csv_file.unlink()
         _log(rank, f"checkpoint path={ckpt_last}")
 
         if not cfg.resume_from:
@@ -516,6 +570,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
                             batch_size=cfg.decoder_init_batch_size,
                             num_workers=cfg.decoder_init_num_workers,
                             device=None,
+                            require_integer=(cfg.batch_correction_method == "none"),
                         )
                         mean_x = torch.clamp(
                             mean_x,
@@ -797,17 +852,33 @@ def train_vae(cfg: VAETrainConfig) -> str:
 
             if is_main:
                 denom = max(nb, 1)
+                train_loss_epoch = total / denom
+                train_recon_epoch = total_recon / denom
+                train_kl_epoch = total_kl / denom
+                train_metric_epoch = total_metric / denom
+                train_adv_epoch = total_adv / denom
+                val_recon_epoch = (val_recon / max(val_nb, 1)) if val_nb > 0 else None
                 val_msg = ""
-                if val_nb > 0:
-                    val_msg = f" val_recon={val_recon/max(val_nb, 1):.4f}"
+                if val_recon_epoch is not None:
+                    val_msg = f" val_recon={val_recon_epoch:.4f}"
                 print(
                     f"[VAE] Epoch {epoch+1}/{cfg.epochs} "
-                    f"loss={total/denom:.4f} "
-                    f"recon={total_recon/denom:.4f} "
-                    f"kl={total_kl/denom:.4f} "
-                    f"metric={total_metric/denom:.4f} "
-                    f"adv={total_adv/denom:.4f}"
+                    f"loss={train_loss_epoch:.4f} "
+                    f"recon={train_recon_epoch:.4f} "
+                    f"kl={train_kl_epoch:.4f} "
+                    f"metric={train_metric_epoch:.4f} "
+                    f"adv={train_adv_epoch:.4f}"
                     f"{val_msg}"
+                )
+                _append_epoch_loss_row(
+                    loss_csv_path,
+                    epoch=epoch + 1,
+                    train_loss=train_loss_epoch,
+                    train_recon=train_recon_epoch,
+                    train_kl=train_kl_epoch,
+                    train_metric=train_metric_epoch,
+                    train_adv=train_adv_epoch,
+                    val_recon=val_recon_epoch,
                 )
 
                 if cfg.save_every > 0 and ((epoch + 1) % cfg.save_every == 0):

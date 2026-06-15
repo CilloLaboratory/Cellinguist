@@ -114,70 +114,9 @@ def estimate_gene_means(
     max_cells: int = 5000,
     batch_size: int = 256,
     num_workers: int = 0,
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    """
-    Estimate per-gene mean counts from up to max_cells (first max_cells in dataset order).
-    Returns (G,) float tensor on CPU.
-    """
-    n = min(max_cells, len(dataset))
-    if n <= 0:
-        raise ValueError("Dataset is empty; cannot estimate gene means.")
-
-    # Build a deterministic DataLoader over first n cells
-    # (assumes dataset order corresponds to adata order; shuffle=False)
-    # We'll stop after covering n items.
-    dl = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=False,
-    )
-
-    sum_x = None
-    total_cells = 0
-
-    for batch in dl:
-        x = batch["x_expr"]  # expected shape (B, G)
-        b = x.shape[0]
-        take = min(b, n - total_cells)
-        if take <= 0:
-            break
-
-        x = x[:take]
-
-        # Basic sanity: finite & non-negative
-        if not torch.isfinite(x).all():
-            raise ValueError("Non-finite values found in x_expr during mean estimation.")
-        if (x < 0).any():
-            raise ValueError("Negative values found in x_expr during mean estimation (ZINB expects counts).")
-
-        x = x.float()
-
-        if sum_x is None:
-            sum_x = x.sum(dim=0)
-        else:
-            sum_x += x.sum(dim=0)
-
-        total_cells += take
-        if total_cells >= n:
-            break
-
-    if sum_x is None or total_cells == 0:
-        raise ValueError("Failed to accumulate gene means (no data batches).")
-
-    mean_x = sum_x / float(total_cells)
-    return mean_x.cpu()
-
-@torch.no_grad()
-def estimate_gene_means(
-    dataset,
-    max_cells: int = 5000,
-    batch_size: int = 256,
-    num_workers: int = 0,
     pin_memory: bool = False,
     device: Optional[torch.device] = None,
+    require_integer: bool = True,
 ) -> torch.Tensor:
     """
     Estimate per-gene mean counts from up to `max_cells` cells of a dataset.
@@ -236,9 +175,9 @@ def estimate_gene_means(
             mn = float(x.min().item())
             raise ValueError(f"Negative values found in x_expr (min={mn}). ZINB expects non-negative counts.")
 
-        # Optional strict integer-valued check (comment out if you intentionally allow non-integer)
-        # This is very useful for catching accidental log-normalized input.
-        if not torch.allclose(x, torch.round(x)):
+        # Useful for catching accidental log-normalized input. Batch correction can
+        # legitimately create fractional pseudo-counts, so callers can disable this.
+        if require_integer and not torch.allclose(x, torch.round(x)):
             # show a few fractional values
             frac = x - torch.round(x)
             idx = torch.nonzero(frac != 0, as_tuple=False)

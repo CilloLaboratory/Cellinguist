@@ -161,6 +161,7 @@ class VAETrainConfig:
 
     checkpoint_dir: str = "checkpoints"
     run_name: str = "vae_run"
+    loss_csv_path: str = ""
     resume_from: Optional[str] = None
     save_every: int = 1
 
