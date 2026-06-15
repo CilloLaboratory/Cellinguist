@@ -68,7 +68,14 @@ def _write_override_tsv(tmp_path: Path, *, include_extra: bool = False) -> Path:
     return out
 
 
-def _write_tiny_transformer_cytokine_ckpt(tmp_path: Path, *, perturbation_mode: str = "cytokine_vector") -> Path:
+def _write_tiny_transformer_cytokine_ckpt(
+    tmp_path: Path,
+    *,
+    perturbation_mode: str = "cytokine_vector",
+    perturb_condition_encoder: bool = True,
+    perturb_condition_decoder: bool = True,
+    include_condition_flags_in_ckpt: bool = True,
+) -> Path:
     encoder = TransformerCellEncoder(
         n_genes=4,
         latent_dim=5,
@@ -78,6 +85,7 @@ def _write_tiny_transformer_cytokine_ckpt(tmp_path: Path, *, perturbation_mode: 
         cond_emb_dim=4,
         perturbation_dim=(2 if perturbation_mode == "cytokine_vector" else None),
         perturb_emb_dim=6,
+        perturb_condition_encoder=perturb_condition_encoder,
         input_transform="none",
         transformer_d_model=8,
         transformer_n_heads=2,
@@ -97,39 +105,47 @@ def _write_tiny_transformer_cytokine_ckpt(tmp_path: Path, *, perturbation_mode: 
         cond_emb_dim=4,
         perturbation_dim=(2 if perturbation_mode == "cytokine_vector" else None),
         perturb_emb_dim=6,
+        perturb_condition_decoder=perturb_condition_decoder,
     )
     model = GeneVAE(encoder, decoder)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    ckpt_path = tmp_path / f"transformer_{perturbation_mode}.ckpt"
+    ckpt_path = tmp_path / (
+        f"transformer_{perturbation_mode}_enc{int(perturb_condition_encoder)}"
+        f"_dec{int(perturb_condition_decoder)}.ckpt"
+    )
+    config_snapshot = {
+        "encoder_type": "transformer",
+        "latent_dim": 5,
+        "hidden_dim": 8,
+        "n_hidden_layers": 1,
+        "cond_emb_dim": 4,
+        "input_transform": "none",
+        "transformer_d_model": 8,
+        "transformer_n_heads": 2,
+        "transformer_n_layers": 1,
+        "transformer_ff_mult": 2,
+        "token_mlp_hidden_dim": 8,
+        "token_mlp_layers": 1,
+        "max_tokens_per_cell": 3,
+        "min_expr_for_token": 0.0,
+        "transformer_precompute_token_indices": True,
+        "perturbation_mode": perturbation_mode,
+        "cytokine_keys": ["IL6", "IFNG"] if perturbation_mode == "cytokine_vector" else None,
+        "cytokine_transform": "none",
+        "cytokine_missing_policy": "error",
+        "perturb_emb_dim": 6,
+    }
+    if include_condition_flags_in_ckpt:
+        config_snapshot["perturb_condition_encoder"] = perturb_condition_encoder
+        config_snapshot["perturb_condition_decoder"] = perturb_condition_decoder
     save_vae_checkpoint(
         path=str(ckpt_path),
         model=model,
         optimizer=opt,
         epoch=0,
         genes_common=["g0", "g1", "g2", "g3"],
-        config_snapshot={
-            "encoder_type": "transformer",
-            "latent_dim": 5,
-            "hidden_dim": 8,
-            "n_hidden_layers": 1,
-            "cond_emb_dim": 4,
-            "input_transform": "none",
-            "transformer_d_model": 8,
-            "transformer_n_heads": 2,
-            "transformer_n_layers": 1,
-            "transformer_ff_mult": 2,
-            "token_mlp_hidden_dim": 8,
-            "token_mlp_layers": 1,
-            "max_tokens_per_cell": 3,
-            "min_expr_for_token": 0.0,
-            "transformer_precompute_token_indices": True,
-            "perturbation_mode": perturbation_mode,
-            "cytokine_keys": ["IL6", "IFNG"] if perturbation_mode == "cytokine_vector" else None,
-            "cytokine_transform": "none",
-            "cytokine_missing_policy": "error",
-            "perturb_emb_dim": 6,
-        },
+        config_snapshot=config_snapshot,
         gene_emb_source="",
     )
     return ckpt_path
@@ -546,6 +562,52 @@ def test_transformer_model_forward_with_and_without_perturb() -> None:
     assert recon_out2[0].shape == (3, 4)
 
 
+def test_transformer_decoder_only_ignores_perturb_in_encoder_but_not_decoder() -> None:
+    x = torch.rand(3, 4)
+    cond = torch.tensor([0, 1, 0], dtype=torch.long)
+    perturb_a = torch.zeros(3, 2)
+    perturb_b = torch.ones(3, 2)
+
+    enc = TransformerCellEncoder(
+        n_genes=4,
+        latent_dim=5,
+        hidden_dim=8,
+        n_hidden_layers=1,
+        n_conditions=2,
+        cond_emb_dim=4,
+        perturbation_dim=2,
+        perturb_emb_dim=6,
+        perturb_condition_encoder=False,
+        input_transform="none",
+        transformer_d_model=8,
+        transformer_n_heads=2,
+        transformer_n_layers=1,
+        transformer_ff_mult=2,
+        token_mlp_hidden_dim=8,
+        token_mlp_layers=1,
+    )
+    dec = ZINBExpressionDecoder(
+        n_genes=4,
+        latent_dim=5,
+        hidden_dim=8,
+        n_hidden_layers=1,
+        n_conditions=2,
+        cond_emb_dim=4,
+        perturbation_dim=2,
+        perturb_emb_dim=6,
+        perturb_condition_decoder=True,
+    )
+    model = GeneVAE(enc, dec)
+
+    mu_a, _ = model.encode(x, cond_idx=cond, perturb_vec=perturb_a)
+    mu_b, _ = model.encode(x, cond_idx=cond, perturb_vec=perturb_b)
+    assert torch.allclose(mu_a, mu_b)
+
+    out_a = model.decode(mu_a, cond_idx=cond, libsize=x.sum(dim=1), perturb_vec=perturb_a)[0]
+    out_b = model.decode(mu_a, cond_idx=cond, libsize=x.sum(dim=1), perturb_vec=perturb_b)[0]
+    assert not torch.allclose(out_a, out_b)
+
+
 def test_transformer_dataset_emits_perturb_and_token_indices_together(tmp_path: Path) -> None:
     h5ad_path = _write_tiny_h5ad(tmp_path)
     ds = SingleCellVAEDataset(
@@ -600,6 +662,68 @@ def test_export_vae_predictions_transformer_counterfactual_uses_checkpoint_cytok
     assert metadata["n_exported_cells"] == 4
 
 
+def test_export_vae_predictions_legacy_checkpoint_defaults_to_dual_conditioning(tmp_path: Path) -> None:
+    h5ad_path = _write_tiny_h5ad(tmp_path)
+    ckpt_path = _write_tiny_transformer_cytokine_ckpt(
+        tmp_path,
+        perturbation_mode="cytokine_vector",
+        include_condition_flags_in_ckpt=False,
+    )
+    override_path = _write_override_tsv(tmp_path)
+    out_path = tmp_path / "pred_legacy.tsv.gz"
+
+    export_predictions(
+        VAEExportConfig(
+            adata_path=str(h5ad_path),
+            checkpoint_path=str(ckpt_path),
+            counterfactual_override_path=str(override_path),
+            out_pred_tsv_gz=str(out_path),
+            gene_key="gene",
+            batch_key="batch",
+            batch_size=2,
+            num_workers=0,
+            device="cpu",
+            backed=False,
+        )
+    )
+
+    metadata = json.loads(Path(str(out_path) + ".metadata.json").read_text())
+    assert metadata["encoder_type"] == "transformer"
+    assert metadata["cytokine_keys"] == ["IL6", "IFNG"]
+    assert metadata["perturb_condition_encoder"] is True
+    assert metadata["perturb_condition_decoder"] is True
+
+
+def test_export_vae_predictions_rejects_disabled_encoder_and_decoder_conditioning(tmp_path: Path) -> None:
+    h5ad_path = _write_tiny_h5ad(tmp_path)
+    ckpt_path = _write_tiny_transformer_cytokine_ckpt(
+        tmp_path,
+        perturbation_mode="cytokine_vector",
+        perturb_condition_encoder=False,
+        perturb_condition_decoder=False,
+    )
+    override_path = _write_override_tsv(tmp_path)
+
+    try:
+        export_predictions(
+            VAEExportConfig(
+                adata_path=str(h5ad_path),
+                checkpoint_path=str(ckpt_path),
+                counterfactual_override_path=str(override_path),
+                out_pred_tsv_gz=str(tmp_path / "unused.tsv.gz"),
+                gene_key="gene",
+                batch_key="batch",
+                batch_size=2,
+                num_workers=0,
+                device="cpu",
+                backed=False,
+            )
+        )
+        assert False, "Expected ValueError when both perturb conditioning flags are disabled."
+    except ValueError:
+        pass
+
+
 def test_export_vae_predictions_transformer_none_mode_regression(tmp_path: Path) -> None:
     h5ad_path = _write_tiny_h5ad(tmp_path)
     ckpt_path = _write_tiny_transformer_cytokine_ckpt(tmp_path, perturbation_mode="none")
@@ -626,7 +750,12 @@ def test_export_vae_predictions_transformer_none_mode_regression(tmp_path: Path)
 
 def test_predict_cytokine_treatment_outputs_baseline_treated_and_delta(tmp_path: Path) -> None:
     h5ad_path = _write_tiny_h5ad(tmp_path)
-    ckpt_path = _write_tiny_transformer_cytokine_ckpt(tmp_path, perturbation_mode="cytokine_vector")
+    ckpt_path = _write_tiny_transformer_cytokine_ckpt(
+        tmp_path,
+        perturbation_mode="cytokine_vector",
+        perturb_condition_encoder=False,
+        perturb_condition_decoder=True,
+    )
     override_path = _write_override_tsv(tmp_path)
     out_dir = tmp_path / "cytokine_out"
 
@@ -656,9 +785,11 @@ def test_predict_cytokine_treatment_outputs_baseline_treated_and_delta(tmp_path:
     assert baseline_df["cell_id"].tolist() == ["cell_0", "cell_1", "cell_2", "cell_3"]
     assert treated_df["cell_id"].tolist() == baseline_df["cell_id"].tolist()
     assert delta_df["cell_id"].tolist() == baseline_df["cell_id"].tolist()
-    assert np.allclose(delta_df[gene_cols].to_numpy(), expected_delta)
+    assert np.allclose(delta_df[gene_cols].to_numpy(), expected_delta, atol=1e-6)
     assert metadata["cytokine_keys"] == ["IL6", "IFNG"]
     assert metadata["encoder_type"] == "transformer"
+    assert metadata["perturb_condition_encoder"] is False
+    assert metadata["perturb_condition_decoder"] is True
 
 
 def test_predict_cytokine_treatment_rejects_extra_override_rows(tmp_path: Path) -> None:

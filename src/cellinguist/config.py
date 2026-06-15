@@ -146,6 +146,8 @@ class VAETrainConfig:
     cytokine_transform: str = "log1p"  # "none" | "log1p" | "zscore"
     cytokine_missing_policy: str = "error"  # "error" | "fill_zero"
     perturb_emb_dim: int = 32
+    perturb_condition_encoder: bool = True
+    perturb_condition_decoder: bool = True
     cytokine_holdout_min_active: int = 2
 
     lr: float = 3e-4
@@ -185,6 +187,8 @@ class VAEExportConfig:
     cytokine_transform: str = "log1p"  # "none" | "log1p" | "zscore"
     cytokine_missing_policy: str = "error"  # "error" | "fill_zero"
     perturb_emb_dim: int = 32
+    perturb_condition_encoder: bool = True
+    perturb_condition_decoder: bool = True
     counterfactual_override_path: Optional[str] = None
 
     # Used only when checkpoint/config indicates encoder_type == "cbow".
@@ -220,6 +224,8 @@ class CytokineTreatmentPredictionConfig:
     cytokine_transform: Optional[str] = None
     cytokine_missing_policy: Optional[str] = None
     perturb_emb_dim: Optional[int] = None
+    perturb_condition_encoder: Optional[bool] = None
+    perturb_condition_decoder: Optional[bool] = None
 
     gene_emb_tsv: str = ""
 

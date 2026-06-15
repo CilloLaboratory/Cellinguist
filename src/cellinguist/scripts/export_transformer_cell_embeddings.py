@@ -42,6 +42,8 @@ def build_transformer_vae_from_checkpoint(
     input_transform = str(train_cfg.get("input_transform", "log1p"))
     use_library_size_covariate = bool(train_cfg.get("use_library_size_covariate", False))
     library_size_covariate_eps = float(train_cfg.get("library_size_covariate_eps", 1e-8))
+    perturb_condition_encoder = bool(train_cfg.get("perturb_condition_encoder", True))
+    perturb_condition_decoder = bool(train_cfg.get("perturb_condition_decoder", True))
 
     max_tokens_per_cell = train_cfg.get("max_tokens_per_cell", None)
     if max_tokens_per_cell_override is not None:
@@ -59,6 +61,7 @@ def build_transformer_vae_from_checkpoint(
         cond_emb_dim=cond_emb_dim,
         perturbation_dim=perturbation_dim,
         perturb_emb_dim=perturb_emb_dim,
+        perturb_condition_encoder=perturb_condition_encoder,
         input_transform=input_transform,
         transformer_d_model=int(train_cfg.get("transformer_d_model", 256)),
         transformer_n_heads=int(train_cfg.get("transformer_n_heads", 8)),
@@ -79,6 +82,7 @@ def build_transformer_vae_from_checkpoint(
         cond_emb_dim=cond_emb_dim,
         perturbation_dim=perturbation_dim,
         perturb_emb_dim=perturb_emb_dim,
+        perturb_condition_decoder=perturb_condition_decoder,
         use_library_size_covariate=use_library_size_covariate,
         library_size_covariate_eps=library_size_covariate_eps,
     )

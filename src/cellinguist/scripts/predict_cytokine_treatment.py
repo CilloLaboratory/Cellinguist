@@ -34,6 +34,12 @@ def _to_export_cfg(cfg: CytokineTreatmentPredictionConfig) -> VAEExportConfig:
         cytokine_transform=str(cfg.cytokine_transform or "log1p"),
         cytokine_missing_policy=str(cfg.cytokine_missing_policy or "error"),
         perturb_emb_dim=int(cfg.perturb_emb_dim or 32),
+        perturb_condition_encoder=(
+            True if cfg.perturb_condition_encoder is None else bool(cfg.perturb_condition_encoder)
+        ),
+        perturb_condition_decoder=(
+            True if cfg.perturb_condition_decoder is None else bool(cfg.perturb_condition_decoder)
+        ),
         counterfactual_override_path=cfg.counterfactual_override_path,
         gene_emb_tsv=cfg.gene_emb_tsv,
         checkpoint_path=cfg.checkpoint_path,
@@ -125,9 +131,11 @@ def predict_cytokine_treatment(cfg: CytokineTreatmentPredictionConfig) -> str:
         "n_exported_cells": int(selected_obs_names.shape[0]),
         "token_index_cache_dir": ctx["token_index_cache_dir"],
         "conditioning_design": (
-            "PerturbationProjector output is concatenated after pooled encoder "
-            "representation and in the decoder; cytokines are not injected as transformer tokens."
+            "PerturbationProjector output is applied according to the checkpoint "
+            "conditioning flags; cytokines are not injected as transformer tokens."
         ),
+        "perturb_condition_encoder": ctx["perturb_condition_encoder"],
+        "perturb_condition_decoder": ctx["perturb_condition_decoder"],
         "outputs": {
             "pred_baseline": str(baseline_path),
             "pred_treated": str(treated_path),

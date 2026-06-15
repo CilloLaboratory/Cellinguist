@@ -69,6 +69,8 @@ cytokine_keys: null
 cytokine_transform: "log1p"
 cytokine_missing_policy: "error"
 perturb_emb_dim: 32
+perturb_condition_encoder: false
+perturb_condition_decoder: true
 cytokine_holdout_min_active: 2
 
 # training

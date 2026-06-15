@@ -8,6 +8,8 @@ cytokine_keys: null
 cytokine_transform: "log1p"
 cytokine_missing_policy: "error"
 perturb_emb_dim: 32
+perturb_condition_encoder: true
+perturb_condition_decoder: true
 counterfactual_override_path: null
 
 # Optional for CBOW checkpoints; not used for Perceiver checkpoints.

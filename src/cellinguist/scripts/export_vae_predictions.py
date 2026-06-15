@@ -82,6 +82,17 @@ def _load_checkpoint_export_context(cfg: VAEExportConfig) -> dict[str, Any]:
     batch_correction_clip_min = float(train_cfg.get("batch_correction_clip_min", 0.1))
     batch_correction_clip_max = float(train_cfg.get("batch_correction_clip_max", 10.0))
     perturb_emb_dim = int(train_cfg.get("perturb_emb_dim", cfg.perturb_emb_dim))
+    perturb_condition_encoder = bool(train_cfg.get("perturb_condition_encoder", cfg.perturb_condition_encoder))
+    perturb_condition_decoder = bool(train_cfg.get("perturb_condition_decoder", cfg.perturb_condition_decoder))
+    if (
+        perturbation_mode == "cytokine_vector"
+        and not perturb_condition_encoder
+        and not perturb_condition_decoder
+    ):
+        raise ValueError(
+            "cytokine_vector mode requires perturb_condition_encoder or "
+            "perturb_condition_decoder to be enabled."
+        )
 
     token_index_cache_dir = ""
     token_index_cache_require = False
@@ -116,6 +127,8 @@ def _load_checkpoint_export_context(cfg: VAEExportConfig) -> dict[str, Any]:
         "batch_correction_clip_min": batch_correction_clip_min,
         "batch_correction_clip_max": batch_correction_clip_max,
         "perturb_emb_dim": perturb_emb_dim,
+        "perturb_condition_encoder": perturb_condition_encoder,
+        "perturb_condition_decoder": perturb_condition_decoder,
         "token_index_cache_dir": token_index_cache_dir,
         "token_index_cache_require": token_index_cache_require,
         "transformer_precompute_token_indices": transformer_precompute_token_indices,
@@ -207,6 +220,7 @@ def _build_model_for_export(
             cond_emb_dim=cond_emb_dim,
             perturbation_dim=perturbation_dim,
             perturb_emb_dim=ctx["perturb_emb_dim"],
+            perturb_condition_encoder=ctx["perturb_condition_encoder"],
             freeze_gene_embeddings=freeze_gene_embeddings,
             input_transform=input_transform,
         )
@@ -220,6 +234,7 @@ def _build_model_for_export(
             cond_emb_dim=cond_emb_dim,
             perturbation_dim=perturbation_dim,
             perturb_emb_dim=ctx["perturb_emb_dim"],
+            perturb_condition_encoder=ctx["perturb_condition_encoder"],
             input_transform=input_transform,
             library_norm=library_norm,
             library_norm_target_sum=library_norm_target_sum,
@@ -242,6 +257,7 @@ def _build_model_for_export(
             cond_emb_dim=cond_emb_dim,
             perturbation_dim=perturbation_dim,
             perturb_emb_dim=ctx["perturb_emb_dim"],
+            perturb_condition_encoder=ctx["perturb_condition_encoder"],
             input_transform=input_transform,
             transformer_d_model=int(train_cfg.get("transformer_d_model", 256)),
             transformer_n_heads=int(train_cfg.get("transformer_n_heads", 8)),
@@ -263,6 +279,7 @@ def _build_model_for_export(
         cond_emb_dim=cond_emb_dim,
         perturbation_dim=perturbation_dim,
         perturb_emb_dim=ctx["perturb_emb_dim"],
+        perturb_condition_decoder=ctx["perturb_condition_decoder"],
         use_library_size_covariate=use_library_size_covariate,
         library_size_covariate_eps=library_size_covariate_eps,
     )
@@ -475,6 +492,8 @@ def export_predictions(cfg: VAEExportConfig) -> None:
         "perturbation_mode": ctx["perturbation_mode"],
         "cytokine_keys": list(ctx["cytokine_keys"]),
         "cytokine_transform": ctx["cytokine_transform"],
+        "perturb_condition_encoder": ctx["perturb_condition_encoder"],
+        "perturb_condition_decoder": ctx["perturb_condition_decoder"],
         "counterfactual_override_path": cfg.counterfactual_override_path,
         "max_cells": cfg.max_cells,
         "max_cells_seed": cfg.max_cells_seed,

@@ -208,6 +208,7 @@ class CBOWCellEncoder(nn.Module):
         cond_emb_dim: int = 16,
         perturbation_dim: Optional[int] = None,
         perturb_emb_dim: int = 32,
+        perturb_condition_encoder: bool = True,
         freeze_gene_embeddings: bool = True,
         input_transform: str = "log1p",   # "log1p" or "none"
     ) -> None:
@@ -237,7 +238,8 @@ class CBOWCellEncoder(nn.Module):
             self.cond_embedding = None
             cond_input_dim = 0
 
-        if perturbation_dim is not None:
+        self.perturb_condition_encoder = bool(perturb_condition_encoder)
+        if perturbation_dim is not None and self.perturb_condition_encoder:
             self.perturb_projector = PerturbationProjector(
                 input_dim=int(perturbation_dim),
                 output_dim=int(perturb_emb_dim),
@@ -346,6 +348,7 @@ class PerceiverCellEncoder(nn.Module):
         cond_emb_dim: int = 16,
         perturbation_dim: Optional[int] = None,
         perturb_emb_dim: int = 32,
+        perturb_condition_encoder: bool = True,
         input_transform: str = "log1p",
         library_norm: str = "size_factor",
         library_norm_target_sum: float = 1e4,
@@ -415,7 +418,8 @@ class PerceiverCellEncoder(nn.Module):
             self.cond_embedding = None
             cond_input_dim = 0
 
-        if perturbation_dim is not None:
+        self.perturb_condition_encoder = bool(perturb_condition_encoder)
+        if perturbation_dim is not None and self.perturb_condition_encoder:
             self.perturb_projector = PerturbationProjector(
                 input_dim=int(perturbation_dim),
                 output_dim=int(perturb_emb_dim),
@@ -513,6 +517,7 @@ class TransformerCellEncoder(nn.Module):
         cond_emb_dim: int = 16,
         perturbation_dim: Optional[int] = None,
         perturb_emb_dim: int = 32,
+        perturb_condition_encoder: bool = True,
         input_transform: str = "log1p",
         transformer_d_model: int = 256,
         transformer_n_heads: int = 8,
@@ -577,7 +582,8 @@ class TransformerCellEncoder(nn.Module):
             self.cond_embedding = None
             cond_input_dim = 0
 
-        if perturbation_dim is not None:
+        self.perturb_condition_encoder = bool(perturb_condition_encoder)
+        if perturbation_dim is not None and self.perturb_condition_encoder:
             self.perturb_projector = PerturbationProjector(
                 input_dim=int(perturbation_dim),
                 output_dim=int(perturb_emb_dim),
@@ -904,6 +910,7 @@ class ExpressionDecoder(nn.Module):
         cond_emb_dim: int = 16,
         perturbation_dim: Optional[int] = None,
         perturb_emb_dim: int = 32,
+        perturb_condition_decoder: bool = True,
     ) -> None:
         super().__init__()
         self.n_genes = n_genes
@@ -915,7 +922,8 @@ class ExpressionDecoder(nn.Module):
             self.cond_embedding = None
             cond_input_dim = 0
 
-        if perturbation_dim is not None:
+        self.perturb_condition_decoder = bool(perturb_condition_decoder)
+        if perturbation_dim is not None and self.perturb_condition_decoder:
             self.perturb_projector = PerturbationProjector(
                 input_dim=int(perturbation_dim),
                 output_dim=int(perturb_emb_dim),
@@ -1081,6 +1089,7 @@ class ZINBExpressionDecoder(nn.Module):
         cond_emb_dim: int = 16,
         perturbation_dim: Optional[int] = None,
         perturb_emb_dim: int = 32,
+        perturb_condition_decoder: bool = True,
         use_library_size_covariate: bool = False,
         library_size_covariate_eps: float = 1e-8,
     ) -> None:
@@ -1099,7 +1108,8 @@ class ZINBExpressionDecoder(nn.Module):
             self.cond_embedding = None
             cond_input_dim = 0
 
-        if perturbation_dim is not None:
+        self.perturb_condition_decoder = bool(perturb_condition_decoder)
+        if perturbation_dim is not None and self.perturb_condition_decoder:
             self.perturb_projector = PerturbationProjector(
                 input_dim=int(perturbation_dim),
                 output_dim=int(perturb_emb_dim),

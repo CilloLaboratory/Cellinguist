@@ -14,6 +14,8 @@ cytokine_keys: null
 cytokine_transform: null
 cytokine_missing_policy: null
 perturb_emb_dim: null
+perturb_condition_encoder: null
+perturb_condition_decoder: null
 
 # Optional for CBOW checkpoints.
 gene_emb_tsv: ""
@@ -29,3 +31,6 @@ backed: true
 token_index_cache_dir: ""
 token_index_cache_require: false
 transformer_precompute_token_indices: true
+
+# Recommended: point this at a decoder-only cytokine VAE checkpoint
+# with perturb_condition_encoder: false and perturb_condition_decoder: true.

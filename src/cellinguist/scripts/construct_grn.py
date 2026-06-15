@@ -94,6 +94,8 @@ def _build_model_from_checkpoint(
     input_transform = str(train_cfg.get("input_transform", "log1p"))
     freeze_gene_embeddings = bool(train_cfg.get("freeze_gene_embeddings", True))
     perturb_emb_dim = int(train_cfg.get("perturb_emb_dim", 32))
+    perturb_condition_encoder = bool(train_cfg.get("perturb_condition_encoder", True))
+    perturb_condition_decoder = bool(train_cfg.get("perturb_condition_decoder", True))
 
     if encoder_type == "cbow":
         emb_path = ckpt_raw.get("gene_emb_source", None)
@@ -112,6 +114,7 @@ def _build_model_from_checkpoint(
             cond_emb_dim=cond_emb_dim,
             perturbation_dim=perturbation_dim,
             perturb_emb_dim=perturb_emb_dim,
+            perturb_condition_encoder=perturb_condition_encoder,
             freeze_gene_embeddings=freeze_gene_embeddings,
             input_transform=input_transform,
         )
@@ -125,6 +128,7 @@ def _build_model_from_checkpoint(
             cond_emb_dim=cond_emb_dim,
             perturbation_dim=perturbation_dim,
             perturb_emb_dim=perturb_emb_dim,
+            perturb_condition_encoder=perturb_condition_encoder,
             input_transform=input_transform,
             library_norm=str(train_cfg.get("library_norm", "size_factor")),
             library_norm_target_sum=float(train_cfg.get("library_norm_target_sum", 1e4)),
@@ -147,6 +151,7 @@ def _build_model_from_checkpoint(
             cond_emb_dim=cond_emb_dim,
             perturbation_dim=perturbation_dim,
             perturb_emb_dim=perturb_emb_dim,
+            perturb_condition_encoder=perturb_condition_encoder,
             input_transform=input_transform,
             transformer_d_model=int(train_cfg.get("transformer_d_model", 256)),
             transformer_n_heads=int(train_cfg.get("transformer_n_heads", 8)),
@@ -168,6 +173,7 @@ def _build_model_from_checkpoint(
         cond_emb_dim=cond_emb_dim,
         perturbation_dim=perturbation_dim,
         perturb_emb_dim=perturb_emb_dim,
+        perturb_condition_decoder=perturb_condition_decoder,
         use_library_size_covariate=bool(train_cfg.get("use_library_size_covariate", False)),
         library_size_covariate_eps=float(train_cfg.get("library_size_covariate_eps", 1e-8)),
     )

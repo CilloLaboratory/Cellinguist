@@ -180,6 +180,15 @@ def train_vae(cfg: VAETrainConfig) -> str:
             raise ValueError("cytokine_missing_policy must be one of: error, fill_zero.")
         if cfg.perturb_emb_dim <= 0:
             raise ValueError("perturb_emb_dim must be > 0.")
+        if (
+            cfg.perturbation_mode == "cytokine_vector"
+            and not bool(cfg.perturb_condition_encoder)
+            and not bool(cfg.perturb_condition_decoder)
+        ):
+            raise ValueError(
+                "cytokine_vector mode requires perturb_condition_encoder or "
+                "perturb_condition_decoder to be enabled."
+            )
         if cfg.cytokine_holdout_min_active < 2:
             raise ValueError("cytokine_holdout_min_active must be >= 2.")
 
@@ -317,6 +326,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 cond_emb_dim=cfg.cond_emb_dim,
                 perturbation_dim=perturbation_dim,
                 perturb_emb_dim=cfg.perturb_emb_dim,
+                perturb_condition_encoder=cfg.perturb_condition_encoder,
                 freeze_gene_embeddings=cfg.freeze_gene_embeddings,
                 input_transform=cfg.input_transform,
             )
@@ -330,6 +340,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 cond_emb_dim=cfg.cond_emb_dim,
                 perturbation_dim=perturbation_dim,
                 perturb_emb_dim=cfg.perturb_emb_dim,
+                perturb_condition_encoder=cfg.perturb_condition_encoder,
                 input_transform=cfg.input_transform,
                 library_norm=cfg.library_norm,
                 library_norm_target_sum=cfg.library_norm_target_sum,
@@ -352,6 +363,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
                 cond_emb_dim=cfg.cond_emb_dim,
                 perturbation_dim=perturbation_dim,
                 perturb_emb_dim=cfg.perturb_emb_dim,
+                perturb_condition_encoder=cfg.perturb_condition_encoder,
                 input_transform=cfg.input_transform,
                 transformer_d_model=cfg.transformer_d_model,
                 transformer_n_heads=cfg.transformer_n_heads,
@@ -372,6 +384,7 @@ def train_vae(cfg: VAETrainConfig) -> str:
             cond_emb_dim=cfg.cond_emb_dim,
             perturbation_dim=perturbation_dim,
             perturb_emb_dim=cfg.perturb_emb_dim,
+            perturb_condition_decoder=cfg.perturb_condition_decoder,
             use_library_size_covariate=cfg.use_library_size_covariate,
             library_size_covariate_eps=cfg.library_size_covariate_eps,
         )

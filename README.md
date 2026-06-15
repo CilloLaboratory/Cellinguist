@@ -154,7 +154,11 @@ The command writes:
 - `delta.tsv.gz`
 - `metadata.json`
 
-Transformer cytokine conditioning in the current implementation does not inject cytokine tokens into self-attention. Instead, the cytokine vector is projected with `PerturbationProjector`, concatenated after CLS pooling in the encoder, and concatenated again in the decoder.
+For counterfactual cytokine work, the recommended training mode is decoder-only conditioning:
+- `perturb_condition_encoder: false`
+- `perturb_condition_decoder: true`
+
+Legacy checkpoints may still use dual conditioning, where the cytokine vector is concatenated after encoder pooling and again in the decoder. In either mode, cytokines are not injected as transformer tokens into self-attention.
 
 If you trained with a transformer token index cache, set `token_index_cache_dir` in the prediction config to reuse it during inference.
 
