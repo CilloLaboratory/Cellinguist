@@ -157,6 +157,9 @@ class VAETrainConfig:
     num_workers: int = 4
     device: str = "cuda"
     grad_clip_norm: float = 1.0
+    grad_accum_steps: int = 1
+    use_amp: bool = False
+    activation_checkpointing: bool = False
     seed: Optional[int] = 0
 
     checkpoint_dir: str = "checkpoints"
@@ -164,6 +167,7 @@ class VAETrainConfig:
     loss_csv_path: str = ""
     resume_from: Optional[str] = None
     save_every: int = 1
+    debug_steps: int = 0
 
     decoder_theta_init: float = 5.0          # initial theta (dispersion), gene-wise
     decoder_pi_init: float = 0.9             # initial dropout prob pi (ZI prob)
